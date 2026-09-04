@@ -9,7 +9,6 @@
 // web page can speak, and this end speaks MIDI because that is what Ableton can
 // hear. Nothing in between interprets the bytes.
 
-import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -18,8 +17,7 @@ import { ALL_PORT_NAMES, CLAIMS, DEFAULT_PORT, PORT_NAMES } from './protocol.js'
 import { createsVirtualPorts, listPorts, openPorts, type MidiBackend } from './ports.js';
 import { startServer } from './server.js';
 import { createToken, lanAddress, pairingUrl } from './pairing.js';
-
-const require = createRequire(import.meta.url);
+import { loadBackend } from './backend.js';
 
 const DEFAULT_APP_ORIGIN = 'https://example.com';
 
@@ -74,21 +72,6 @@ function loadVersion(): string {
     } catch {
         return '0.0.0';
     }
-}
-
-/**
- * The real MIDI backend.
- *
- * Loaded through `require` rather than imported so that a machine without the
- * native module still runs the tests - `ports.ts` takes the backend as an
- * argument for exactly this reason.
- */
-function loadBackend(): MidiBackend {
-    const midi = require('@julusian/midi');
-    return {
-        platform: process.platform,
-        createOutput: () => new midi.Output(),
-    };
 }
 
 function banner(args: Args, token: string, ports: ReturnType<typeof openPorts>, version: string): void {
@@ -158,11 +141,13 @@ function main(): void {
 
     let backend: MidiBackend;
     try {
-        backend = loadBackend();
+        backend = loadBackend(version);
     } catch (error) {
         console.error('\n  Could not load the MIDI bindings.\n');
         console.error(`  ${error instanceof Error ? error.message : String(error)}\n`);
-        console.error('  If you installed with npx, try again with a Node 20 or newer.\n');
+        console.error('  Running from npx? Node 20 or newer is needed.');
+        console.error('  Running a downloaded build? Please report this with the line above:');
+        console.error('  https://github.com/olteanalexandru/music-theory-midi-bridge/issues\n');
         process.exitCode = 1;
         return;
     }
