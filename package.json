@@ -1,0 +1,46 @@
+{
+    "name": "music-theory-midi-bridge",
+    "version": "1.0.0",
+    "description": "Play a DAW from the Music Theory Cheatsheet instruments on your phone. A browser cannot create a MIDI port; this can.",
+    "license": "MIT",
+    "author": "Alexandru-Florin Oltean",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/olteanalexandru/music-theory-midi-bridge.git"
+    },
+    "homepage": "https://github.com/olteanalexandru/music-theory-midi-bridge#readme",
+    "bugs": {
+        "url": "https://github.com/olteanalexandru/music-theory-midi-bridge/issues"
+    },
+    "keywords": ["midi", "mpe", "ableton", "websocket", "bridge", "loopmidi"],
+    "type": "module",
+    "bin": {
+        "music-theory-midi-bridge": "dist/index.js"
+    },
+    "main": "dist/index.js",
+    "files": ["dist", "README.md", "LICENSE"],
+    "engines": {
+        "node": ">=20"
+    },
+    "scripts": {
+        "build": "tsc",
+        "start": "node dist/index.js",
+        "dev": "tsc --watch",
+        "test": "vitest run",
+        "test:watch": "vitest",
+        "typecheck": "tsc --noEmit",
+        "prepublishOnly": "npm run build"
+    },
+    "dependencies": {
+        "@julusian/midi": "^3.1.1",
+        "qrcode-terminal": "^0.12.0",
+        "ws": "^8.18.0"
+    },
+    "devDependencies": {
+        "@types/node": "^22.10.0",
+        "@types/qrcode-terminal": "^0.12.2",
+        "@types/ws": "^8.5.13",
+        "typescript": "^5.7.2",
+        "vitest": "^2.1.8"
+    }
+}
