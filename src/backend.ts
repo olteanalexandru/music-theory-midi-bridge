@@ -41,11 +41,18 @@ interface NativeAddon {
     Output: new () => MidiOutputPort;
 }
 
-/** True when running from a pkg-built executable rather than from node_modules. */
+/**
+ * True when running from a pkg-built executable rather than from node_modules.
+ *
+ * `process.pkg` is the real signal. The path check is a fallback for a build
+ * that does not set it, and it looks for BOTH markers because they differ by
+ * version: the original pkg rooted its virtual filesystem at `C:\snapshot\`,
+ * and @yao-pkg/pkg roots it at `C:\**\` - which is exactly the sort of thing
+ * that is invisible until a downloaded binary refuses to open a MIDI port.
+ */
 export function inBinary(): boolean {
-    // pkg sets process.pkg; the snapshot path is the belt-and-braces check for
-    // a build that sets it differently.
-    return Boolean((process as { pkg?: unknown }).pkg) || __filenameSafe().includes('snapshot');
+    const path = __filenameSafe();
+    return Boolean((process as { pkg?: unknown }).pkg) || path.includes('snapshot') || path.includes('/**/');
 }
 
 function __filenameSafe(): string {
@@ -86,15 +93,16 @@ function extractBinding(version: string): string {
     // pkg roots its virtual filesystem at whatever directory it built from, so
     // the path contains a name this file cannot know - it is the checkout
     // directory, which differs between a laptop and a CI runner. Deriving it
-    // from this module's own location is therefore first and correct; the
-    // literal roots are fallbacks for a pkg version that resolves import.meta
-    // differently, and on Windows both the POSIX and drive-letter spellings of
-    // the snapshot root work.
+    // from this module's own location is therefore first, and is the one that
+    // actually worked when this was tested against a real published binary.
+    // The literal roots are fallbacks for a pkg version that resolves
+    // import.meta differently, and they differ by version: `**` for
+    // @yao-pkg/pkg, `snapshot` for the original.
     const here = dirname(fileURLToPath(import.meta.url));
     const candidates = [
         join(here, '..', prebuildPath()),
+        join('/**', 'music-theory-midi-bridge', prebuildPath()),
         join('/snapshot', 'music-theory-midi-bridge', prebuildPath()),
-        join('C:\\snapshot', 'music-theory-midi-bridge', prebuildPath()),
     ];
 
     let lastError: unknown = null;

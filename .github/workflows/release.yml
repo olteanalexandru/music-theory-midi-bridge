@@ -61,17 +61,19 @@ jobs:
       - run: npm ci
       - run: npm run build
 
-      # The native .node has to be carried in beside the executable: pkg
-      # bundles JavaScript, and a native addon is not that.
+      # `pkg .` and not `pkg dist/index.js`, which is the difference between a
+      # working download and a broken one: given an entry FILE, pkg ignores the
+      # `pkg.assets` glob in package.json, so the native MIDI binding never
+      # entered the snapshot and every binary could do everything except open a
+      # port. Given the package, it reads the config and carries the .node in.
       - name: Package
         shell: bash
         run: |
-          npx @yao-pkg/pkg dist/index.js \
+          npx @yao-pkg/pkg . \
             --targets ${{ matrix.target }} \
             --output ${{ matrix.asset }}
           mkdir -p out
           mv ${{ matrix.asset }} out/
-          cp -r node_modules/@julusian/midi/build/Release/*.node out/ 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:
