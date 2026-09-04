@@ -18,9 +18,12 @@ Configuration Message all arrive exactly as the app sent them.
 npx music-theory-midi-bridge
 ```
 
-Needs Node 20 or newer. Or grab a standalone build from
+Needs Node 20 or newer, and is the route to reach for first. Or grab a
+standalone build from
 [Releases](https://github.com/olteanalexandru/music-theory-midi-bridge/releases)
-and double-click it.
+and double-click it — Windows, Linux and Apple Silicon. There is no Intel Mac
+build: GitHub retired the last x64 macOS runner and a native MIDI addon cannot
+be cross-compiled from Apple Silicon, so Intel Macs use `npx`.
 
 It prints an address, a pairing token and a QR code. Scan the QR with the phone
 and it opens the app with the connection already filled in.

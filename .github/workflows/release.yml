@@ -40,9 +40,11 @@ jobs:
           - os: windows-latest
             target: node20-win-x64
             asset: music-theory-midi-bridge-win-x64.exe
-          - os: macos-13
-            target: node20-macos-x64
-            asset: music-theory-midi-bridge-macos-x64
+          # No Intel Mac build. GitHub retired the macos-13 image, which was
+          # the last x64 runner, and a native addon cannot be cross-compiled
+          # from Apple Silicon - so the job simply queued forever and took the
+          # whole release with it. Intel Macs use npx, which the README leads
+          # with anyway.
           - os: macos-latest
             target: node20-macos-arm64
             asset: music-theory-midi-bridge-macos-arm64
@@ -78,8 +80,11 @@ jobs:
 
   release:
     needs: build
+    # Not `success()`: a single platform failing or losing its runner should
+    # still publish the builds that worked. A release with three binaries beats
+    # a release with none while somebody investigates the fourth.
+    if: always() && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/download-artifact@v4
         with:
