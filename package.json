@@ -1,6 +1,6 @@
 {
     "name": "music-theory-midi-bridge",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "Play a DAW from the Music Theory Cheatsheet instruments on your phone. A browser cannot create a MIDI port; this can.",
     "license": "MIT",
     "author": "Alexandru-Florin Oltean",
