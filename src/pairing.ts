@@ -62,7 +62,7 @@ export interface PairingLink {
     host: string;
     port: number;
     token: string;
-    /** Origin of the deployed app, e.g. https://example.com */
+    /** Origin of the deployed app, e.g. https://note-noodle.com */
     appOrigin: string;
     /** Which instrument page to open. */
     claim: Claim;

@@ -19,7 +19,14 @@ import { startServer } from './server.js';
 import { createToken, lanAddress, pairingUrl } from './pairing.js';
 import { loadBackend } from './backend.js';
 
-const DEFAULT_APP_ORIGIN = 'https://example.com';
+// The site the QR code should open. NOT a placeholder, and it used to be one:
+// this is the fallback for every run that passes neither --app nor
+// TUTOR_APP_ORIGIN, which is very nearly every run, so `example.com` here meant
+// the printed URL and the QR code beside it both pointed at a domain that is
+// not ours. Nothing failed - the bridge came up, claimed its ports and waited -
+// and the one thing it exists to do, hand a phone a working link, could not
+// work. parseArgs is exported below so a test pins this to a real origin.
+const DEFAULT_APP_ORIGIN = 'https://note-noodle.com';
 
 interface Args {
     port: number;
@@ -199,4 +206,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     main();
 }
 
-export { CLAIMS, PORT_NAMES };
+export { CLAIMS, PORT_NAMES, DEFAULT_APP_ORIGIN, parseArgs };

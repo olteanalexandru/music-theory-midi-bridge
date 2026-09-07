@@ -124,7 +124,7 @@ per-track routing above.
 ```
 --port <n>     Port to listen on (default 8532)
 --token <s>    Use this token instead of a fresh one
---app <url>    Origin the QR code should open (default https://example.com)
+--app <url>    Origin the QR code should open (default https://note-noodle.com)
 --quiet        No QR code, no banner
 --help
 ```
