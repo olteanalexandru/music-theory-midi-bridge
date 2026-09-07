@@ -42,6 +42,23 @@ export function createToken(length = 12): string {
  * a USB-tethered link presents as v4 anyway.
  */
 export function lanAddress(): string | null {
+    return lanAddresses()[0] ?? null;
+}
+
+/**
+ * Every address a phone might be able to reach, best guess first.
+ *
+ * Plural because the singular version was a guess presented as a fact, and on
+ * a developer's machine it is very often the wrong one: Hyper-V, WSL, Docker
+ * and most VPN clients all take a 192.168.x address, and os.networkInterfaces
+ * does not promise an order. The bridge would then print one address the phone
+ * cannot reach, and that failure - a blank console here, "nothing answered"
+ * there - is indistinguishable from the helper not running at all.
+ *
+ * So the preference is kept, because it is right on an ordinary machine, and
+ * the rest are printed underneath it with --host to pin one.
+ */
+export function lanAddresses(): string[] {
     const interfaces = networkInterfaces();
     const candidates: string[] = [];
     for (const entries of Object.values(interfaces)) {
@@ -51,11 +68,12 @@ export function lanAddress(): string | null {
             candidates.push(entry.address);
         }
     }
-    if (candidates.length === 0) return null;
     // A USB-tethered phone usually lands on 192.168.x, and so does most home
     // Wi-Fi; prefer it over the 172.x a container or VPN adapter tends to take,
-    // which is reachable from nothing the player is holding.
-    return candidates.find((address) => address.startsWith('192.168.')) ?? candidates[0];
+    // which is reachable from nothing the player is holding. A stable sort, so
+    // the operating system's own order survives within each group.
+    const rank = (address: string) => (address.startsWith('192.168.') ? 0 : 1);
+    return [...candidates].sort((left, right) => rank(left) - rank(right));
 }
 
 export interface PairingLink {
@@ -64,9 +82,20 @@ export interface PairingLink {
     token: string;
     /** Origin of the deployed app, e.g. https://note-noodle.com */
     appOrigin: string;
-    /** Which instrument page to open. */
-    claim: Claim;
 }
+
+/**
+ * Where a scan lands.
+ *
+ * It used to be an instrument page, chosen by claim, with 'staff' hard-coded as
+ * the one the QR opened. That page is behind a purchase, so a scan by anybody
+ * who had not bought the Stylophone showed a buy card - and the part of the app
+ * that reads ?bridge= out of the URL only runs on a mounted instrument, so the
+ * address it had just carried across the room was dropped on the floor. This
+ * page is gated by nothing and does the connecting; the instruments are one tap
+ * on from it, and they inherit the address because the app saves it.
+ */
+export const PAIRING_PATH = '/app/bridge';
 
 /** Instrument pages, mirroring INSTRUMENT_PATHS in the app. */
 export const CLAIM_PATHS: Record<Claim, string> = {
@@ -76,9 +105,9 @@ export const CLAIM_PATHS: Record<Claim, string> = {
     staff: '/app/playable-staff',
 };
 
-export function pairingUrl({ host, port, token, appOrigin, claim }: PairingLink): string {
+export function pairingUrl({ host, port, token, appOrigin }: PairingLink): string {
     const origin = appOrigin.replace(/\/+$/, '');
     // One parameter carrying host:port rather than two, because it is one fact
     // and the app should not have to cope with half of it arriving.
-    return `${origin}${CLAIM_PATHS[claim]}?bridge=${encodeURIComponent(`${host}:${port}`)}&t=${encodeURIComponent(token)}`;
+    return `${origin}${PAIRING_PATH}?bridge=${encodeURIComponent(`${host}:${port}`)}&t=${encodeURIComponent(token)}`;
 }

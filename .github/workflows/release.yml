@@ -1,8 +1,10 @@
 # Standalone builds, attached to a release on tag.
 #
-# The npx route is the one that always works and needs no CI at all; this exists
-# so somebody without Node can double-click something instead. Both are offered
-# in the README, in that order, on purpose.
+# These are the ONLY way to get this program today. The README used to lead with
+# `npx music-theory-midi-bridge` as the route that always works, and it never
+# worked: the package has never been published, so the registry returns a 404
+# and everybody who took the short path got an error. Until `npm publish` is
+# run, this workflow's output is the whole distribution.
 #
 # @julusian/midi is a native addon, so each binary has to be built on its own
 # platform - there is no cross-compiling this. That is why the matrix is runners
@@ -103,12 +105,14 @@ jobs:
           body: |
             ## Install
 
-            ```
-            npx music-theory-midi-bridge
-            ```
-
-            Or download the build for your machine below.
+            Download the build for your machine below and run it. (There is no
+            `npx` line here on purpose: this package has never been published
+            to npm, and the registry 404s for it.)
 
             **Windows** also needs [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)
             and four ports created by hand — the bridge prints the exact names
             on startup. macOS and Linux need nothing else.
+
+            Scan the QR code it prints with the phone. It opens a pairing page
+            with the address filled in; one tap connects, and it names any
+            loopMIDI port it could not find.

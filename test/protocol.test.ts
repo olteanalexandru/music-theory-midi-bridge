@@ -16,7 +16,7 @@ import {
     isClaim,
     parseMessage,
 } from '../src/protocol.js';
-import { CLAIM_PATHS, createToken, pairingUrl } from '../src/pairing.js';
+import { CLAIM_PATHS, PAIRING_PATH, createToken, pairingUrl } from '../src/pairing.js';
 
 describe('parsing a MIDI frame', () => {
     it('reads exactly what the app sends', () => {
@@ -94,9 +94,20 @@ describe('pairing', () => {
             port: 8532,
             token: 'abc123',
             appOrigin: 'https://example.com',
-            claim: 'staff',
         });
-        expect(url).toBe('https://example.com/app/playable-staff?bridge=192.168.1.20%3A8532&t=abc123');
+        expect(url).toBe('https://example.com/app/bridge?bridge=192.168.1.20%3A8532&t=abc123');
+    });
+
+    it('lands somewhere no purchase can hide', () => {
+        // The regression this replaced a passing test for. The link used to
+        // open an INSTRUMENT page, and 'staff' was the hard-coded one: that
+        // page is wrapped in the app's purchase gate, so a scan by anybody who
+        // had not bought the Stylophone rendered a buy card with no MIDI panel
+        // on it - and the part of the app that reads ?bridge= only runs on a
+        // mounted instrument, so the address never got read at all. The old
+        // test asserted the exact URL and was perfectly happy.
+        expect(PAIRING_PATH).toBe('/app/bridge');
+        for (const claim of CLAIMS) expect(PAIRING_PATH).not.toBe(CLAIM_PATHS[claim]);
     });
 
     it('does not double the slash on an origin with a trailing one', () => {
@@ -105,9 +116,8 @@ describe('pairing', () => {
             port: 9,
             token: 't',
             appOrigin: 'https://example.com/',
-            claim: 'pads',
         });
-        expect(url).toContain('https://example.com/app/pads?');
+        expect(url).toContain('https://example.com/app/bridge?');
     });
 
     it('makes a token nobody has to disambiguate by hand', () => {

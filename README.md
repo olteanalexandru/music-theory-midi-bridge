@@ -14,19 +14,23 @@ Configuration Message all arrive exactly as the app sent them.
 
 ## Install and run
 
-```bash
-npx music-theory-midi-bridge
-```
-
-Needs Node 20 or newer, and is the route to reach for first. Or grab a
-standalone build from
+Grab a standalone build from
 [Releases](https://github.com/olteanalexandru/music-theory-midi-bridge/releases)
 and double-click it — Windows, Linux and Apple Silicon. There is no Intel Mac
 build: GitHub retired the last x64 macOS runner and a native MIDI addon cannot
-be cross-compiled from Apple Silicon, so Intel Macs use `npx`.
+be cross-compiled from Apple Silicon, so an Intel Mac has to build from source
+(`npm install && npm run build && node dist/index.js`).
+
+> **`npx music-theory-midi-bridge` does not work yet.** This package has never
+> been published to npm — the registry returns a 404 for it — so the one-liner
+> that used to head this section sent everybody who tried it into an error. The
+> releases above are real and current. When 1.0.1 is published the line comes
+> back, here and on the app's download page, which gates it on the same fact.
 
 It prints an address, a pairing token and a QR code. Scan the QR with the phone
-and it opens the app with the connection already filled in.
+and it opens a pairing page with the connection already filled in — one tap to
+connect, and it names any loopMIDI port it could not find. Every instrument
+picks the address up from there.
 
 ```
   music-theory-midi-bridge 1.0.0
@@ -72,6 +76,39 @@ meanwhile.
 
 **macOS and Linux need none of this** — the ports are created on startup and
 disappear when you quit.
+
+---
+
+## Windows also has a firewall
+
+Defender asks once, on the first run, whether to let this accept connections.
+That prompt is easy to dismiss, and dismissing it — or allowing it only for
+"Public" networks while your Wi-Fi is classified "Private", or the reverse —
+blocks every connection from the phone with no further sign of it anywhere.
+
+The tell is that this program's console stays **completely empty** after a
+scan. Every line it prints about a connection comes from a socket that already
+completed its handshake, so a blank console means nothing arrived: firewall, or
+an address the phone cannot reach (see `--host` below), and nothing else.
+
+Fix it in Windows Security → Firewall & network protection → Allow an app
+through firewall, with both Private and Public ticked for this program.
+
+---
+
+## If the phone will not connect
+
+Three causes, in the order worth checking.
+
+1. **This console is empty after a scan.** Nothing reached the program. That is
+   the firewall above, or the advertised address being one of your machine's
+   virtual adapters rather than the one the phone shares — `--host` pins it.
+2. **The phone says the browser will not allow it.** A page served over https
+   cannot open an insecure WebSocket, and this program has no certificate. Use
+   the Android app, which carries that one exemption, or run the helper on the
+   same machine as the browser — a connection to `localhost` is exempt.
+3. **`! refused: no port named …`.** A loopMIDI port with that exact name does
+   not exist. Create it and restart.
 
 ---
 
@@ -125,9 +162,15 @@ per-track routing above.
 --port <n>     Port to listen on (default 8532)
 --token <s>    Use this token instead of a fresh one
 --app <url>    Origin the QR code should open (default https://note-noodle.com)
+--host <ip>    Advertise this address instead of guessing one
 --quiet        No QR code, no banner
 --help
 ```
+
+`--host` is worth knowing about before you need it. This program has to guess
+which of your machine's addresses the phone can reach, and Hyper-V, WSL, Docker
+and most VPN clients all hold LAN-looking ones that it cannot. Every address
+found is printed under the chosen one; pin the right one with this.
 
 The token is not decoration. This is a socket open to your local network that
 injects MIDI into whatever your machine is running, so a device without the

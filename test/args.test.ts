@@ -51,7 +51,6 @@ describe('the default app origin', () => {
                 port: args.port,
                 token: 'abc123',
                 appOrigin: args.appOrigin,
-                claim: 'staff',
             });
             expect(url.startsWith('https://note-noodle.com/app/')).toBe(true);
             expect(url).not.toContain('example.com');

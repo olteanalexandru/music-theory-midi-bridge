@@ -16,7 +16,7 @@ import qrcode from 'qrcode-terminal';
 import { ALL_PORT_NAMES, CLAIMS, DEFAULT_PORT, PORT_NAMES } from './protocol.js';
 import { createsVirtualPorts, listPorts, openPorts, type MidiBackend } from './ports.js';
 import { startServer } from './server.js';
-import { createToken, lanAddress, pairingUrl } from './pairing.js';
+import { createToken, lanAddresses, pairingUrl } from './pairing.js';
 import { loadBackend } from './backend.js';
 
 // The site the QR code should open. NOT a placeholder, and it used to be one:
@@ -32,6 +32,8 @@ interface Args {
     port: number;
     token: string;
     appOrigin: string;
+    /** Pins the advertised address. Empty means "work it out". See lanAddresses. */
+    host: string;
     quiet: boolean;
     help: boolean;
 }
@@ -41,6 +43,7 @@ function parseArgs(argv: string[]): Args {
         port: DEFAULT_PORT,
         token: '',
         appOrigin: process.env.TUTOR_APP_ORIGIN ?? DEFAULT_APP_ORIGIN,
+        host: '',
         quiet: false,
         help: false,
     };
@@ -50,6 +53,7 @@ function parseArgs(argv: string[]): Args {
         if (flag === '--port' && value) { args.port = Number(value); i++; }
         else if (flag === '--token' && value) { args.token = value; i++; }
         else if (flag === '--app' && value) { args.appOrigin = value; i++; }
+        else if (flag === '--host' && value) { args.host = value; i++; }
         else if (flag === '--quiet') args.quiet = true;
         else if (flag === '--help' || flag === '-h') args.help = true;
     }
@@ -64,12 +68,20 @@ music-theory-midi-bridge - play a DAW on this computer from a phone
   --port <n>     Port to listen on (default ${DEFAULT_PORT})
   --token <s>    Use this pairing token instead of a fresh one
   --app <url>    Origin of the app the QR code should open
+  --host <ip>    Advertise this address instead of guessing one
   --quiet        No QR code, no banner
   --help         This
 
 The phone connects over your local network, so both devices have to be on the
 same one. A USB-C cable with tethering on works too, and is usually steadier
 than Wi-Fi.
+
+If the phone cannot reach it, the address is the first thing to check: virtual
+adapters (Hyper-V, WSL, Docker, a VPN) take LAN-looking addresses too, and this
+program can only guess which one your phone is on. Every address it found is
+printed; --host pins the right one. On Windows the second thing to check is the
+firewall - Defender asks once, on the first run, and a declined prompt blocks
+every connection with no further sign of it.
 `;
 
 function loadVersion(): string {
@@ -82,7 +94,12 @@ function loadVersion(): string {
 }
 
 function banner(args: Args, token: string, ports: ReturnType<typeof openPorts>, version: string): void {
-    const host = lanAddress();
+    const found = lanAddresses();
+    // --host wins outright: it is somebody who already knows which of their
+    // adapters the phone is on, and this program's guess is what they are
+    // correcting.
+    const host = args.host || found[0] || null;
+    const alternatives = found.filter((address) => address !== host);
     const virtual = createsVirtualPorts(process.platform);
 
     console.log(`\n  music-theory-midi-bridge ${version}\n`);
@@ -123,12 +140,34 @@ function banner(args: Args, token: string, ports: ReturnType<typeof openPorts>, 
     console.log(`\n  Address:  ${host}:${args.port}`);
     console.log(`  Token:    ${token}`);
 
+    // Printed because the one above is a GUESS, and a wrong guess here is
+    // indistinguishable from this program not running: the phone says "nothing
+    // answered" and this console stays empty, because the connection never
+    // arrived. Virtual adapters - Hyper-V, WSL, Docker, VPN clients - hold
+    // LAN-looking addresses no phone can reach, and nothing here can tell them
+    // apart from the real one.
+    if (alternatives.length > 0) {
+        console.log('\n  Other addresses on this machine, if the phone cannot reach that one:');
+        for (const address of alternatives) console.log(`    - ${address}`);
+        console.log('  Pin one with --host <address>.');
+    }
+
+    // The other blank-console failure, and the one nothing anywhere mentioned.
+    if (!virtual) {
+        console.log('\n  Windows Defender asks once, on the first run, whether to allow this');
+        console.log('  through the firewall. If that was declined - or allowed only for the');
+        console.log('  wrong network type - the phone cannot reach this and nothing here');
+        console.log('  will say so. Windows Security > Firewall > Allow an app.');
+    }
+
     if (args.quiet) return;
 
-    // One QR per instrument would be four QR codes and a decision to make.
-    // The staff is the one that opens by default; every other instrument picks
-    // up the same stored address once one of them has it.
-    const url = pairingUrl({ host, port: args.port, token, appOrigin: args.appOrigin, claim: 'staff' });
+    // One QR, and no instrument in it. It used to open the playable staff,
+    // which is behind a purchase, so a scan showed a buy card and the address
+    // it carried was never read. It opens the pairing page instead - gated by
+    // nothing, connects on one tap, and names any loopMIDI port it could not
+    // find. Every instrument picks up the same stored address from there.
+    const url = pairingUrl({ host, port: args.port, token, appOrigin: args.appOrigin });
     console.log('\n  Scan this with the phone:\n');
     qrcode.generate(url, { small: true }, (code: string) => console.log(code));
     console.log(`  ${url}\n`);
@@ -159,7 +198,14 @@ function main(): void {
         return;
     }
 
-    const ports = openPorts(backend, ALL_PORT_NAMES);
+    const ports = openPorts(backend, ALL_PORT_NAMES, (portName, error) => {
+        // Once per port. A port that stops accepting notes mid-session -
+        // loopMIDI closed, a device unplugged - used to drop every message
+        // after it in silence, which reads as "MIDI is broken" rather than as
+        // "that port went away".
+        const detail = error instanceof Error ? error.message : String(error);
+        console.log(`  ! ${portName} stopped accepting notes: ${detail}`);
+    });
     banner(args, token, ports, version);
 
     if (!createsVirtualPorts(backend.platform) && ports.open.size === 0) {

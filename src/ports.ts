@@ -108,7 +108,11 @@ export function listPorts(backend: MidiBackend): string[] {
  * playing, with the fourth explained. Refusing to start at all would be a
  * worse answer to a problem the player can fix in ten seconds.
  */
-export function openPorts(backend: MidiBackend, names: string[] = ALL_PORT_NAMES): PortSet {
+export function openPorts(
+    backend: MidiBackend,
+    names: string[] = ALL_PORT_NAMES,
+    onSendError?: (portName: string, error: unknown) => void
+): PortSet {
     const virtual = createsVirtualPorts(backend.platform);
     const open = new Map<string, OpenPort>();
     const missing: string[] = [];
@@ -139,15 +143,25 @@ export function openPorts(backend: MidiBackend, names: string[] = ALL_PORT_NAMES
             continue;
         }
 
+        let reportedSendError = false;
         open.set(name, {
             name,
             send: (bytes) => {
                 try {
                     output.sendMessage(bytes);
-                } catch {
+                } catch (error) {
                     // A port yanked mid-note (loopMIDI closed, device
                     // unplugged) must not take down the server everything else
-                    // is playing through.
+                    // is playing through - but it must not be silent either.
+                    // Every note after it goes nowhere, and "nothing is coming
+                    // out and nothing said so" is the failure this whole
+                    // program exists to avoid. Once per port: a dead port is
+                    // dead for every message after the first, and a trill would
+                    // print a hundred lines a second.
+                    if (!reportedSendError) {
+                        reportedSendError = true;
+                        onSendError?.(name, error);
+                    }
                 }
             },
             close: () => {
