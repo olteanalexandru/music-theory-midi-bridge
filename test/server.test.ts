@@ -43,7 +43,7 @@ class FakeOutput implements MidiOutputPort {
         this.opened = name;
     }
     closePort() {}
-    sendMessage(bytes: number[]) {
+    sendMessage(bytes: Buffer) {
         this.sent.push([...bytes]);
     }
 }

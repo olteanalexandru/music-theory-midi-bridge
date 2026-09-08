@@ -32,7 +32,23 @@ export interface MidiOutputPort {
     openPort(index: number): void;
     openVirtualPort(name: string): void;
     closePort(): void;
-    sendMessage(bytes: number[]): void;
+    /**
+     * A BUFFER, not an array, and the type is load-bearing.
+     *
+     * `@julusian/midi`'s JavaScript wrapper accepts either - it calls
+     * `Buffer.from` on an array before handing it down. The NATIVE addon
+     * accepts only a Buffer and throws `First argument must be a buffer` for
+     * anything else. Both are reachable here: from npm this file gets the
+     * wrapper, and from a pkg-built binary backend.ts loads the raw addon by
+     * absolute path, because the wrapper is not in the snapshot.
+     *
+     * So an array worked from source and threw in every downloaded binary -
+     * once, on the first note, after which `reportedSendError` silenced it and
+     * every note went nowhere. The connection was fine, `hello` was fine,
+     * `missing` was empty, and not one byte reached a MIDI port. Measured
+     * against 1008 MPE frames from a phone: zero arrived.
+     */
+    sendMessage(bytes: Buffer): void;
 }
 
 export interface MidiBackend {
@@ -173,7 +189,12 @@ export function openPorts(
             name,
             send: (bytes) => {
                 try {
-                    output.sendMessage(bytes);
+                    // Buffer.from HERE rather than at the call site, because
+                    // this is the only place that knows which of the two
+                    // implementations is on the other side - see the note on
+                    // MidiOutputPort.sendMessage. Cheap: a few hundred bytes a
+                    // second even under a fast trill.
+                    output.sendMessage(Buffer.from(bytes));
                 } catch (error) {
                     // A port yanked mid-note (loopMIDI closed, device
                     // unplugged) must not take down the server everything else

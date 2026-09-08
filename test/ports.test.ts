@@ -15,6 +15,8 @@ class FakeOutput implements MidiOutputPort {
     virtualName: string | null = null;
     closed = false;
     sent: number[][] = [];
+    /** What `sendMessage` was actually handed, so the Buffer contract is checkable. */
+    sentRaw: unknown[] = [];
 
     constructor(private readonly existing: string[], private readonly failOn?: string) {}
 
@@ -35,7 +37,8 @@ class FakeOutput implements MidiOutputPort {
     closePort(): void {
         this.closed = true;
     }
-    sendMessage(bytes: number[]): void {
+    sendMessage(bytes: Buffer): void {
+        this.sentRaw.push(bytes);
         this.sent.push([...bytes]);
     }
 }
@@ -147,6 +150,16 @@ describe('sending', () => {
     it('writes the bytes it was given, unaltered', () => {
         ports.open.get(PORT_NAMES.staff)!.send([0x90, 60, 100]);
         expect(outputs[0].sent).toEqual([[0x90, 60, 100]]);
+    });
+
+    it('hands the addon a Buffer, which an array-only send got wrong in every shipped binary', () => {
+        // The wrapper `require('@julusian/midi')` returns converts an array to
+        // a Buffer for you; the NATIVE addon throws `First argument must be a
+        // buffer`. A pkg build loads the raw addon (backend.ts), so passing an
+        // array worked from source and failed in every download - once, on the
+        // first note, and silently for every note after it.
+        ports.open.get(PORT_NAMES.staff)!.send([0x90, 60, 100]);
+        expect(Buffer.isBuffer(outputs[0].sentRaw[0])).toBe(true);
     });
 
     it('survives a port that goes away mid-note', () => {
