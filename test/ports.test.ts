@@ -171,3 +171,70 @@ describe('listing what is there', () => {
         expect(listPorts(backend)).toEqual(['loopMIDI Port', 'Microsoft GS Wavetable Synth']);
     });
 });
+
+describe('refreshing a port, because a snapshot goes stale', () => {
+    // The bug this exists for, measured on a real machine: a helper that had
+    // been running an afternoon accepted a WebSocket, reported the port open
+    // and `missing` empty in its hello frame, accepted every message - and
+    // delivered NOT ONE BYTE to loopMIDI. A helper started thirty seconds
+    // later, same port, same code, delivered them all. `open` and `missing`
+    // were computed once at startup and had outlived what they described.
+
+    it('picks up a port that did not exist at startup', () => {
+        // loopMIDI opened after the helper, which is the ordinary way round
+        // for somebody following the setup instructions in the banner.
+        const existing: string[] = [];
+        const made = backendFor('win32', existing);
+        const ports = openPorts(made.backend, [PORT_NAMES.staff]);
+        expect(ports.open.has(PORT_NAMES.staff)).toBe(false);
+        expect(ports.missing).toEqual([PORT_NAMES.staff]);
+
+        existing.push(PORT_NAMES.staff);
+        expect(ports.refresh(PORT_NAMES.staff)).toBe(true);
+        expect(ports.open.has(PORT_NAMES.staff)).toBe(true);
+        // `missing` is a claim about now, not a record of what once was.
+        expect(ports.missing).toEqual([]);
+    });
+
+    it('notices a port that has gone away', () => {
+        const existing = [PORT_NAMES.staff];
+        const made = backendFor('win32', existing);
+        const ports = openPorts(made.backend, [PORT_NAMES.staff]);
+        expect(ports.open.has(PORT_NAMES.staff)).toBe(true);
+
+        existing.length = 0;
+        expect(ports.refresh(PORT_NAMES.staff)).toBe(false);
+        expect(ports.open.has(PORT_NAMES.staff)).toBe(false);
+        expect(ports.missing).toEqual([PORT_NAMES.staff]);
+    });
+
+    it('hands back a genuinely new handle, which is the whole point', () => {
+        const made = backendFor('win32', [PORT_NAMES.staff]);
+        const ports = openPorts(made.backend, [PORT_NAMES.staff]);
+        const before = ports.open.get(PORT_NAMES.staff);
+        ports.refresh(PORT_NAMES.staff);
+        const after = ports.open.get(PORT_NAMES.staff);
+        expect(after).toBeDefined();
+        expect(after).not.toBe(before);
+        // And the old one is released rather than leaked.
+        expect(made.outputs[0].closed).toBe(true);
+    });
+
+    it('closes nothing and claims nothing for a port it does not route to', () => {
+        const made = backendFor('darwin');
+        const ports = openPorts(made.backend, [PORT_NAMES.staff]);
+        const opened = made.outputs.length;
+        expect(ports.refresh('Some Other Port')).toBe(false);
+        expect(ports.missing).toEqual([]);
+        expect(made.outputs.length).toBe(opened);
+    });
+
+    it('does not resurrect a port on a platform that makes its own', () => {
+        // macOS and Linux create their ports, so a refresh there is a
+        // re-create rather than a re-find - and it has to keep working.
+        const made = backendFor('darwin');
+        const ports = openPorts(made.backend, [PORT_NAMES.staff]);
+        expect(ports.refresh(PORT_NAMES.staff)).toBe(true);
+        expect(ports.open.has(PORT_NAMES.staff)).toBe(true);
+    });
+});

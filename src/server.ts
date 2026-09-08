@@ -69,6 +69,16 @@ export function startServer(options: ServerOptions): RunningServer {
     const wss = new WebSocketServer({ port: options.port, path: WS_PATH });
     const report = options.onEvent ?? (() => undefined);
 
+    /**
+     * How many live sockets are writing to each port.
+     *
+     * Only used to decide whether a port can safely be re-opened - see the
+     * refresh below. Counted rather than a boolean because two devices really
+     * can claim one port, and the second one leaving must not make the first
+     * one's handle look abandoned.
+     */
+    const inUse = new Map<string, number>();
+
     wss.on('connection', (socket: WebSocket, request: IncomingMessage) => {
         const url = new URL(request.url ?? WS_PATH, 'http://localhost');
         const token = url.searchParams.get('t') ?? '';
@@ -94,6 +104,27 @@ export function startServer(options: ServerOptions): RunningServer {
         }
 
         const portName = claim ? PORT_NAMES[claim] : DEFAULT_PORT_NAME;
+
+        // Re-open it before answering, because `open` and `missing` were a
+        // snapshot taken at startup and this process outlives what it
+        // snapshotted. Restart loopMIDI and every handle in that map is stale
+        // while the map still lists them as open - so the client connects,
+        // hello says the port is open and nothing is missing, every message is
+        // accepted, and not one byte reaches a MIDI port.
+        //
+        // Measured on a real machine: a fresh helper delivered notes, and the
+        // instance that had been running all afternoon delivered none - same
+        // port, same second, same code.
+        //
+        // ONLY when nobody else is on that port. `refresh` hands back a NEW
+        // handle and closes the old one, and an existing client captured the
+        // old one in its message callback - so refreshing under a live
+        // connection would silently stop the instrument that was already
+        // playing, which is the exact failure this is here to remove. A
+        // connection to an idle port is the common case and the one that
+        // matters; two devices on one port keep whatever handle they started
+        // with.
+        if ((inUse.get(portName) ?? 0) === 0) options.ports.refresh(portName);
         const port = options.ports.open.get(portName);
 
         // Hello goes out even when the port is missing, and BEFORE the close:
@@ -118,6 +149,7 @@ export function startServer(options: ServerOptions): RunningServer {
         }
 
         report({ type: 'connected', claim, portName, client });
+        inUse.set(portName, (inUse.get(portName) ?? 0) + 1);
 
         socket.on('message', (data) => {
             const message = parseMessage(typeof data === 'string' ? data : data.toString('utf8'));
@@ -129,6 +161,7 @@ export function startServer(options: ServerOptions): RunningServer {
         });
 
         socket.on('close', () => {
+            inUse.set(portName, Math.max(0, (inUse.get(portName) ?? 1) - 1));
             report({ type: 'disconnected', claim, portName });
         });
 

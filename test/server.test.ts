@@ -27,6 +27,8 @@ const TOKEN = 'letmein12345';
 
 class FakeOutput implements MidiOutputPort {
     sent: number[][] = [];
+    /** Which port this one ended up on, so a test can ask by name. */
+    opened = '';
     constructor(private readonly existing: string[]) {}
     getPortCount() {
         return this.existing.length;
@@ -34,8 +36,12 @@ class FakeOutput implements MidiOutputPort {
     getPortName(index: number) {
         return this.existing[index] ?? '';
     }
-    openPort() {}
-    openVirtualPort() {}
+    openPort(index: number) {
+        this.opened = this.existing[index] ?? '';
+    }
+    openVirtualPort(name: string) {
+        this.opened = name;
+    }
     closePort() {}
     sendMessage(bytes: number[]) {
         this.sent.push([...bytes]);
@@ -59,6 +65,20 @@ let server: RunningServer;
 let port: number;
 let outputs: FakeOutput[];
 let ports: ReturnType<typeof openPorts>;
+
+/**
+ * Everything that reached one named port, across every handle it has had.
+ *
+ * By name rather than by index into `outputs`, because a port can be re-opened
+ * while the server runs - `PortSet.refresh` closes the old handle and makes a
+ * new one when an idle port is claimed, which is how a stale loopMIDI handle
+ * gets repaired. An index captured at boot would point at the handle that is
+ * no longer the one being written to, and the test would report an empty port
+ * for a port that is working perfectly.
+ */
+function sentTo(name: string): number[][] {
+    return outputs.filter((output) => output.opened === name).flatMap((output) => output.sent);
+}
 
 /** A free port. 0 lets the OS pick, but `ws` needs a number we know. */
 function ephemeralPort(): number {
@@ -157,10 +177,8 @@ describe('claiming a port, which is claiming an Ableton track', () => {
         b.socket.send(JSON.stringify({ t: 0, b: [0x90, 67, 100] }));
         await settle();
 
-        const staffPort = outputs[ALL_PORT_NAMES.indexOf(PORT_NAMES.staff)];
-        const thereminPort = outputs[ALL_PORT_NAMES.indexOf(PORT_NAMES.theremin)];
-        expect(staffPort.sent).toEqual([[0x90, 60, 100]]);
-        expect(thereminPort.sent).toEqual([[0x90, 67, 100]]);
+        expect(sentTo(PORT_NAMES.staff)).toEqual([[0x90, 60, 100]]);
+        expect(sentTo(PORT_NAMES.theremin)).toEqual([[0x90, 67, 100]]);
 
         a.socket.close();
         b.socket.close();
@@ -206,8 +224,7 @@ describe('what reaches the port', () => {
         const { socket } = await connect(`?t=${TOKEN}&port=staff`);
         socket.send(JSON.stringify({ t: 3, b: [0xe1, 0x00, 0x50] }));
         await settle();
-        const staffPort = outputs[ALL_PORT_NAMES.indexOf(PORT_NAMES.staff)];
-        expect(staffPort.sent).toEqual([[0xe1, 0x00, 0x50]]);
+        expect(sentTo(PORT_NAMES.staff)).toEqual([[0xe1, 0x00, 0x50]]);
         socket.close();
     });
 
@@ -230,8 +247,7 @@ describe('what reaches the port', () => {
         for (const bytes of handshake) socket.send(JSON.stringify({ t: 0, b: bytes }));
         await settle();
 
-        const staffPort = outputs[ALL_PORT_NAMES.indexOf(PORT_NAMES.staff)];
-        expect(staffPort.sent).toEqual(handshake);
+        expect(sentTo(PORT_NAMES.staff)).toEqual(handshake);
         socket.close();
     });
 
@@ -242,8 +258,7 @@ describe('what reaches the port', () => {
         socket.send(JSON.stringify({ t: 0, b: [0x90, 60, 100] }));
         await settle();
 
-        const staffPort = outputs[ALL_PORT_NAMES.indexOf(PORT_NAMES.staff)];
-        expect(staffPort.sent).toEqual([[0x90, 60, 100]]);
+        expect(sentTo(PORT_NAMES.staff)).toEqual([[0x90, 60, 100]]);
         expect(socket.readyState).toBe(WebSocket.OPEN);
         socket.close();
     });
@@ -274,5 +289,55 @@ describe('housekeeping', () => {
         await settle();
         expect(events).toContain('connected');
         expect(events).toContain('disconnected');
+    });
+});
+
+describe('re-opening the port a client is about to use', () => {
+    // A helper outlives what it measured at startup. Restart loopMIDI under a
+    // running one and every handle it holds is stale while its map still
+    // reports them open - so hello says the port is fine, every message is
+    // accepted, and nothing reaches MIDI. Re-opening on connect is what makes
+    // hello a statement about now.
+
+    it('opens a fresh handle when the port is idle', async () => {
+        boot();
+        const name = PORT_NAMES.staff;
+        const before = outputs.filter((output) => output.opened === name).length;
+
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        const after = outputs.filter((output) => output.opened === name).length;
+        expect(after).toBe(before + 1);
+
+        // And the fresh one is the one that gets written to.
+        socket.send(JSON.stringify({ t: 0, b: [0x90, 60, 100] }));
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(sentTo(name)).toEqual([[0x90, 60, 100]]);
+        socket.close();
+    });
+
+    it('leaves the handle alone while somebody is already on that port', async () => {
+        // Refresh closes the old handle, and a connected client captured it -
+        // so refreshing under a live connection would silently stop the
+        // instrument that was already playing. That is the exact failure this
+        // whole change exists to remove, and it must not be reintroduced by
+        // the fix for it.
+        boot();
+        const name = PORT_NAMES.staff;
+        const first = await connect(`?t=${TOKEN}&port=staff`);
+        const afterFirst = outputs.filter((output) => output.opened === name).length;
+
+        const second = await connect(`?t=${TOKEN}&port=staff`);
+        expect(outputs.filter((output) => output.opened === name).length).toBe(afterFirst);
+
+        // Both are still writing to the same, still-open port.
+        first.socket.send(JSON.stringify({ t: 0, b: [0x90, 60, 100] }));
+        second.socket.send(JSON.stringify({ t: 1, b: [0x80, 60, 0] }));
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        expect(sentTo(name)).toEqual([
+            [0x90, 60, 100],
+            [0x80, 60, 0],
+        ]);
+        first.socket.close();
+        second.socket.close();
     });
 });

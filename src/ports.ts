@@ -56,6 +56,26 @@ export interface PortSet {
     /** True when this platform makes its own ports. */
     virtual: boolean;
     closeAll(): void;
+    /**
+     * Close and re-open one port, and say whether it is usable now.
+     *
+     * `open` and `missing` were a snapshot taken once, at startup, and a
+     * long-running helper outlives the thing it snapshotted. Restart loopMIDI -
+     * or let Windows renumber its devices - and every handle in that map is
+     * stale while the map still cheerfully lists them as open.
+     *
+     * The failure that produces is the worst kind this program has: a client
+     * connects, `hello` reports the port open and `missing` empty, every
+     * message is accepted, and NOT ONE BYTE reaches a MIDI port. Measured, on a
+     * real machine: a fresh helper delivered notes and the instance that had
+     * been running for an afternoon delivered none, same port, same second,
+     * same code. Nothing anywhere said so.
+     *
+     * So the snapshot is refreshed at the one moment it matters and costs
+     * nothing - when a client connects, which is rare, and is exactly when
+     * somebody is about to play.
+     */
+    refresh(name: string): boolean;
 }
 
 /** Windows is the only platform where ports have to already exist. */
@@ -117,7 +137,14 @@ export function openPorts(
     const open = new Map<string, OpenPort>();
     const missing: string[] = [];
 
-    for (const name of names) {
+    /**
+     * One port, opened. Null when it does not exist or will not open.
+     *
+     * Extracted so `refresh` opens a port exactly the way startup did - two
+     * copies of this would be two answers to "is this port usable", and the
+     * whole point of refresh is that the second answer is the trustworthy one.
+     */
+    const openOne = (name: string): OpenPort | null => {
         const output = backend.createOutput();
         try {
             if (virtual) {
@@ -126,8 +153,7 @@ export function openPorts(
                 const index = findPortIndex(output, name);
                 if (index < 0) {
                     output.closePort();
-                    missing.push(name);
-                    continue;
+                    return null;
                 }
                 output.openPort(index);
             }
@@ -139,12 +165,11 @@ export function openPorts(
             } catch {
                 // Already gone.
             }
-            missing.push(name);
-            continue;
+            return null;
         }
 
         let reportedSendError = false;
-        open.set(name, {
+        return {
             name,
             send: (bytes) => {
                 try {
@@ -171,7 +196,13 @@ export function openPorts(
                     // Already gone.
                 }
             },
-        });
+        };
+    };
+
+    for (const name of names) {
+        const port = openOne(name);
+        if (port) open.set(name, port);
+        else missing.push(name);
     }
 
     return {
@@ -181,6 +212,24 @@ export function openPorts(
         closeAll: () => {
             for (const port of open.values()) port.close();
             open.clear();
+        },
+        refresh: (name) => {
+            // Only ports this helper routes to. A refresh of anything else is
+            // a caller bug, and inventing a port for it would be worse.
+            if (!names.includes(name)) return false;
+            open.get(name)?.close();
+            open.delete(name);
+            const port = openOne(name);
+            if (port) {
+                open.set(name, port);
+                // It exists again, so it is no longer missing. Startup's list
+                // is a claim about the past; this is a claim about now.
+                const at = missing.indexOf(name);
+                if (at >= 0) missing.splice(at, 1);
+                return true;
+            }
+            if (!missing.includes(name)) missing.push(name);
+            return false;
         },
     };
 }
