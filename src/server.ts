@@ -18,6 +18,7 @@ import {
     CLOSE_BAD_TOKEN,
     CLOSE_NO_PORT,
     DEFAULT_PORT_NAME,
+    MAX_FRAME_BYTES,
     PORT_NAMES,
     PROTOCOL_VERSION,
     WS_PATH,
@@ -30,6 +31,13 @@ import type { PortSet } from './ports.js';
 
 export interface ServerOptions {
     port: number;
+    /**
+     * The interface to listen on. Absent means every interface, which is the
+     * default on purpose: the phone may arrive over Wi-Fi or over a USB tether,
+     * and those are two different addresses on this machine. Pass one to shut
+     * the other out.
+     */
+    bind?: string;
     /** Rejected without it. See the note on why a LAN service needs one. */
     token: string;
     ports: PortSet;
@@ -66,7 +74,9 @@ function tokensMatch(given: string, expected: string): boolean {
 }
 
 export function startServer(options: ServerOptions): RunningServer {
-    const wss = new WebSocketServer({ port: options.port, path: WS_PATH });
+    // maxPayload: a frame past it is refused by `ws` itself (close 1009) before
+    // it is buffered - see MAX_FRAME_BYTES.
+    const wss = new WebSocketServer({ port: options.port, host: options.bind, path: WS_PATH, maxPayload: MAX_FRAME_BYTES });
     const report = options.onEvent ?? (() => undefined);
 
     /**

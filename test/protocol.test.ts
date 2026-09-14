@@ -27,6 +27,14 @@ describe('parsing a MIDI frame', () => {
         expect(parseMessage('{"t":0,"b":[176,74,64]}')).toEqual({ t: 0, b: [176, 74, 64] });
     });
 
+    it('still passes the real-time messages a sequencer sends', () => {
+        // Clock, start and stop live in the same 0xF_ range as SysEx and must
+        // not be caught by refusing it.
+        for (const status of [0xf8, 0xfa, 0xfc]) {
+            expect(parseMessage(JSON.stringify({ t: 1, b: [status] }))?.b).toEqual([status]);
+        }
+    });
+
     it('takes a long frame, because MPE sends plenty of them', () => {
         const bytes = Array.from({ length: 64 }, (_, i) => i % 128);
         expect(parseMessage(JSON.stringify({ t: 1, b: bytes }))?.b).toHaveLength(64);
@@ -45,6 +53,10 @@ describe('parsing a MIDI frame', () => {
         ['a negative byte', '{"t":1,"b":[-1]}'],
         ['a fractional byte', '{"t":1,"b":[144.5]}'],
         ['a byte that is a string', '{"t":1,"b":["144"]}'],
+        // The app never sends SysEx, and SysEx is what can reprogram or brick
+        // hardware on the far side of the port.
+        ['a SysEx message', '{"t":1,"b":[240,67,16,76,0,0,126,0,247]}'],
+        ['a stray SysEx end', '{"t":1,"b":[144,60,100,247]}'],
     ] as const) {
         it(`drops ${label} rather than throwing`, () => {
             // This socket is open to a local network. A bad frame is a thing

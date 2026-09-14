@@ -114,6 +114,21 @@ export const CLOSE_NO_PORT = 4003;
  * open to a local network, so a bad frame is a thing to drop, not a thing to
  * crash the helper somebody is playing through.
  */
+/**
+ * The largest frame the server will read, in bytes.
+ *
+ * One message is one MIDI event - three bytes, or the six of an RPN - wrapped
+ * in a few dozen bytes of JSON. `ws` would otherwise accept a 100 MiB frame and
+ * buffer the whole of it before this code ever saw a byte, which on a socket
+ * reachable from a shared network is a way to stall the machine a DAW is
+ * running on. Four kilobytes is two orders of magnitude of headroom.
+ */
+export const MAX_FRAME_BYTES = 4096;
+
+/** System Exclusive start and end. See parseMessage. */
+const SYSEX_START = 0xf0;
+const SYSEX_END = 0xf7;
+
 export function parseMessage(raw: string): BridgeMessage | null {
     let value: unknown;
     try {
@@ -132,6 +147,13 @@ export function parseMessage(raw: string): BridgeMessage | null {
         // a corrupt frame into a wrong note, which is harder to notice than no
         // note at all.
         if (typeof byte !== 'number' || !Number.isInteger(byte) || byte < 0 || byte > 255) return null;
+        // SysEx is refused outright. The app never sends it - it calls
+        // requestMIDIAccess with SysEx off and emits no 0xF0 byte anywhere -
+        // so a frame carrying one did not come from the app, and SysEx is the
+        // one MIDI message that can reprogram, overwrite or brick hardware on
+        // the other end of the port. Data bytes are all below 0x80, so either
+        // byte appearing anywhere in a frame can only mean SysEx.
+        if (byte === SYSEX_START || byte === SYSEX_END) return null;
         bytes.push(byte);
     }
     return { t: message.t, b: bytes };

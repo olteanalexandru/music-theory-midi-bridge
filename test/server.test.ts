@@ -18,6 +18,7 @@ import {
     CLOSE_BAD_TOKEN,
     CLOSE_NO_PORT,
     DEFAULT_PORT_NAME,
+    MAX_FRAME_BYTES,
     PORT_NAMES,
     PROTOCOL_VERSION,
     type HelloMessage,
@@ -261,6 +262,25 @@ describe('what reaches the port', () => {
         expect(sentTo(PORT_NAMES.staff)).toEqual([[0x90, 60, 100]]);
         expect(socket.readyState).toBe(WebSocket.OPEN);
         socket.close();
+    });
+
+    it('never forwards SysEx to the port', async () => {
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        socket.send(JSON.stringify({ t: 0, b: [0xf0, 0x7e, 0x7f, 0x09, 0x01, 0xf7] }));
+        socket.send(JSON.stringify({ t: 0, b: [0x90, 62, 100] }));
+        await settle();
+
+        expect(sentTo(PORT_NAMES.staff)).toEqual([[0x90, 62, 100]]);
+        socket.close();
+    });
+
+    it('refuses a frame far larger than any MIDI event, rather than buffering it', async () => {
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        const closed = new Promise<number>((resolve) => socket.on('close', (code) => resolve(code)));
+        socket.send('x'.repeat(MAX_FRAME_BYTES * 4));
+        // 1009 is "message too big", sent by ws itself before the frame is read.
+        expect(await closed).toBe(1009);
+        expect(sentTo(PORT_NAMES.staff)).toEqual([]);
     });
 });
 

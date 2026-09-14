@@ -34,6 +34,12 @@ interface Args {
     appOrigin: string;
     /** Pins the advertised address. Empty means "work it out". See lanAddresses. */
     host: string;
+    /**
+     * The interface to LISTEN on, which is a different question from the one
+     * --host answers. Empty means every interface, because Wi-Fi and a USB
+     * tether reach this machine on two different addresses.
+     */
+    bind: string;
     quiet: boolean;
     help: boolean;
 }
@@ -44,6 +50,7 @@ function parseArgs(argv: string[]): Args {
         token: '',
         appOrigin: process.env.TUTOR_APP_ORIGIN ?? DEFAULT_APP_ORIGIN,
         host: '',
+        bind: '',
         quiet: false,
         help: false,
     };
@@ -54,6 +61,7 @@ function parseArgs(argv: string[]): Args {
         else if (flag === '--token' && value) { args.token = value; i++; }
         else if (flag === '--app' && value) { args.appOrigin = value; i++; }
         else if (flag === '--host' && value) { args.host = value; i++; }
+        else if (flag === '--bind' && value) { args.bind = value; i++; }
         else if (flag === '--quiet') args.quiet = true;
         else if (flag === '--help' || flag === '-h') args.help = true;
     }
@@ -69,6 +77,7 @@ music-theory-midi-bridge - play a DAW on this computer from a phone
   --token <s>    Use this pairing token instead of a fresh one
   --app <url>    Origin of the app the QR code should open
   --host <ip>    Advertise this address instead of guessing one
+  --bind <ip>    Listen only on this interface (default: all of them)
   --quiet        No QR code, no banner
   --help         This
 
@@ -216,6 +225,7 @@ function main(): void {
 
     const server = startServer({
         port: args.port,
+        bind: args.bind || undefined,
         token,
         ports,
         version,
