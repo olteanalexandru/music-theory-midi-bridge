@@ -88,3 +88,89 @@ describe('overriding it', () => {
         }
     });
 });
+
+describe('--log-midi', () => {
+    /** Runs with TUTOR_BRIDGE_LOG_MIDI set to `value` (or unset), restoring it after. */
+    function withEnv<T>(value: string | undefined, run: () => T): T {
+        const previous = process.env.TUTOR_BRIDGE_LOG_MIDI;
+        if (value === undefined) delete process.env.TUTOR_BRIDGE_LOG_MIDI;
+        else process.env.TUTOR_BRIDGE_LOG_MIDI = value;
+        try {
+            return run();
+        } finally {
+            if (previous === undefined) delete process.env.TUTOR_BRIDGE_LOG_MIDI;
+            else process.env.TUTOR_BRIDGE_LOG_MIDI = previous;
+        }
+    }
+
+    it('is off by default, so a player sees no line per note', () => {
+        withEnv(undefined, () => {
+            const args = parseArgs([]);
+            expect(args.logMidi).toBeNull();
+            expect(args.logFile).toBe('');
+            expect(args.warnings).toEqual([]);
+        });
+    });
+
+    it('means everything when given bare', () => {
+        withEnv(undefined, () => expect(parseArgs(['--log-midi']).logMidi).toBe('all'));
+    });
+
+    it('takes a level after an equals sign or as the next word', () => {
+        withEnv(undefined, () => {
+            expect(parseArgs(['--log-midi=notes']).logMidi).toBe('notes');
+            expect(parseArgs(['--log-midi=expr']).logMidi).toBe('expr');
+            expect(parseArgs(['--log-midi', 'expr']).logMidi).toBe('expr');
+            expect(parseArgs(['--log-midi', 'notes', '--port', '9000'])).toMatchObject({ logMidi: 'notes', port: 9000 });
+        });
+    });
+
+    it('does not eat the next flag as a level', () => {
+        withEnv(undefined, () => {
+            expect(parseArgs(['--log-midi', '--quiet'])).toMatchObject({ logMidi: 'all', quiet: true });
+        });
+    });
+
+    it('is independent of --quiet', () => {
+        withEnv(undefined, () => {
+            expect(parseArgs(['--quiet', '--log-midi=notes'])).toMatchObject({ logMidi: 'notes', quiet: true });
+        });
+    });
+
+    it('says so about a level it does not know, and logs everything rather than nothing', () => {
+        withEnv(undefined, () => {
+            const spelled = parseArgs(['--log-midi=verbose']);
+            expect(spelled.logMidi).toBe('all');
+            expect(spelled.warnings[0]).toContain('verbose');
+
+            const spaced = parseArgs(['--log-midi', 'cc', '--quiet']);
+            expect(spaced).toMatchObject({ logMidi: 'all', quiet: true });
+            expect(spaced.warnings[0]).toContain('cc');
+        });
+    });
+
+    it('reads TUTOR_BRIDGE_LOG_MIDI', () => {
+        withEnv('expr', () => expect(parseArgs([]).logMidi).toBe('expr'));
+        withEnv('1', () => expect(parseArgs([]).logMidi).toBe('all'));
+        withEnv('off', () => expect(parseArgs([]).logMidi).toBeNull());
+        withEnv('', () => expect(parseArgs([]).logMidi).toBeNull());
+        withEnv('loud', () => {
+            const args = parseArgs([]);
+            expect(args.logMidi).toBe('all');
+            expect(args.warnings[0]).toContain('TUTOR_BRIDGE_LOG_MIDI=loud');
+        });
+    });
+
+    it('takes the flag over the environment', () => {
+        withEnv('all', () => expect(parseArgs(['--log-midi=notes']).logMidi).toBe('notes'));
+    });
+
+    it('takes a file for JSON Lines, either way of writing it', () => {
+        withEnv(undefined, () => {
+            expect(parseArgs(['--log-file', 'midi.jsonl']).logFile).toBe('midi.jsonl');
+            expect(parseArgs(['--log-file=C:\\logs\\midi.jsonl']).logFile).toBe('C:\\logs\\midi.jsonl');
+            // A file on its own logs to the file, not to the console.
+            expect(parseArgs(['--log-file', 'midi.jsonl']).logMidi).toBeNull();
+        });
+    });
+});

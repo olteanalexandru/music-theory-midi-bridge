@@ -13,8 +13,10 @@ import {
     DEFAULT_PORT_NAME,
     PORT_NAMES,
     PROTOCOL_VERSION,
+    REASON_VALUE_CHARS,
     isClaim,
     parseMessage,
+    parseMessageDetailed,
 } from '../src/protocol.js';
 import { CLAIM_PATHS, PAIRING_PATH, createToken, pairingUrl } from '../src/pairing.js';
 
@@ -66,6 +68,48 @@ describe('parsing a MIDI frame', () => {
             expect(parseMessage(raw)).toBeNull();
         });
     }
+});
+
+describe('saying why a frame was dropped', () => {
+    // Only for --log-midi: the socket still gets no answer. "Dropped" alone
+    // would send whoever reads the log to the source to find which rule broke.
+    it('agrees with parseMessage about what is accepted', () => {
+        expect(parseMessageDetailed('{"t":12,"b":[144,60,100]}')).toEqual({ ok: true, message: { t: 12, b: [144, 60, 100] } });
+    });
+
+    for (const [raw, reason] of [
+        ['hello', 'not JSON'],
+        ['42', 'not a JSON object'],
+        ['{"b":[144]}', 't is missing or not a finite number'],
+        ['{"t":1,"b":[]}', 'b is missing or empty'],
+        ['{"t":1,"b":[144,300,100]}', 'b[1] = 300 is not a MIDI byte (an integer 0-255)'],
+        ['{"t":1,"b":[144,"60"]}', 'b[1] = "60" is not a MIDI byte (an integer 0-255)'],
+        ['{"t":1,"b":[240,67,247]}', 'SysEx refused (0xF0 at b[0])'],
+        ['{"t":1,"b":[144,60,100,247]}', 'SysEx refused (0xF7 at b[3])'],
+    ] as const) {
+        it(`says "${reason}"`, () => {
+            expect(parseMessageDetailed(raw)).toEqual({ ok: false, reason });
+            expect(parseMessage(raw)).toBeNull();
+        });
+    }
+
+    it('quotes at most 40 characters of the value it refused', () => {
+        // One entry of `b` can be most of a 4 KB frame; quoted whole, one bad
+        // frame put a 4 KB line in the log.
+        const huge = 'x'.repeat(3000);
+        const parsed = parseMessageDetailed(JSON.stringify({ t: 1, b: [144, huge] }));
+        expect(parsed).toEqual({
+            ok: false,
+            reason: `b[1] = "${'x'.repeat(REASON_VALUE_CHARS - 1)}... is not a MIDI byte (an integer 0-255)`,
+        });
+    });
+
+    it('quotes a nested object shortened the same way, and a short one whole', () => {
+        const nested = parseMessageDetailed(JSON.stringify({ t: 1, b: [{ deep: { deeper: 'y'.repeat(100) } }] }));
+        expect(nested.ok ? '' : nested.reason).toMatch(/^b\[0\] = \{"deep":\{"deeper":"y+\.\.\. is not a MIDI byte/);
+        expect(nested.ok ? 0 : nested.reason.indexOf('...')).toBe('b[0] = '.length + REASON_VALUE_CHARS);
+        expect(parseMessageDetailed('{"t":1,"b":[true]}')).toEqual({ ok: false, reason: 'b[0] = true is not a MIDI byte (an integer 0-255)' });
+    });
 });
 
 describe('the port table, which is the Ableton routing', () => {

@@ -10,7 +10,13 @@
 
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import WebSocket from 'ws';
-import { startServer, type RunningServer } from '../src/server.js';
+import {
+    startServer,
+    type ConnectionCloseInfo,
+    type DropInfo,
+    type MessageInfo,
+    type RunningServer,
+} from '../src/server.js';
 import { openPorts, type MidiBackend, type MidiOutputPort } from '../src/ports.js';
 import {
     ALL_PORT_NAMES,
@@ -25,6 +31,19 @@ import {
 } from '../src/protocol.js';
 
 const TOKEN = 'letmein12345';
+
+/** The MPE handshake from 'carries a whole MPE handshake through in order', for the log hooks. */
+const HANDSHAKE_FOR_LOG = [
+    [0xb0, 101, 0],
+    [0xb0, 100, 6],
+    [0xb0, 6, 15],
+    [0xb1, 101, 0],
+    [0xb1, 100, 0],
+    [0xb1, 6, 48],
+    [0x91, 60, 100],
+    [0xe1, 0x00, 0x60],
+    [0x81, 60, 64],
+];
 
 class FakeOutput implements MidiOutputPort {
     sent: number[][] = [];
@@ -309,6 +328,269 @@ describe('housekeeping', () => {
         await settle();
         expect(events).toContain('connected');
         expect(events).toContain('disconnected');
+    });
+});
+
+describe('the hooks --log-midi reads from', () => {
+    // The server stays free of formatting; it hands the log what it saw. These
+    // pin what it hands over, over a real socket, because a log fed the wrong
+    // connection id or the wrong bytes would describe somebody else's stream.
+    type Seen = {
+        messages: MessageInfo[];
+        drops: DropInfo[];
+        closes: ConnectionCloseInfo[];
+    };
+
+    async function bootWithHooks(): Promise<Seen> {
+        await server.close();
+        const seen: Seen = { messages: [], drops: [], closes: [] };
+        port = ephemeralPort();
+        server = startServer({
+            port,
+            token: TOKEN,
+            ports,
+            version: 'x',
+            platform: 'darwin',
+            onMessage: (info) => seen.messages.push(info),
+            onDrop: (info) => seen.drops.push(info),
+            onConnectionClose: (info) => seen.closes.push(info),
+        });
+        return seen;
+    }
+
+    it('hands over every forwarded frame with its connection, port, claim, client and t', async () => {
+        const seen = await bootWithHooks();
+        const { socket } = await connect(`?t=${TOKEN}&port=staff&client=android-app`);
+        for (const [index, bytes] of HANDSHAKE_FOR_LOG.entries()) socket.send(JSON.stringify({ t: 10 + index, b: bytes }));
+        await settle();
+
+        expect(seen.messages.map((info) => info.bytes)).toEqual(HANDSHAKE_FOR_LOG);
+        const [first] = seen.messages;
+        expect(first).toMatchObject({ portName: PORT_NAMES.staff, claim: 'staff', client: 'android-app', t: 10 });
+        expect(first.connId).toBeGreaterThan(0);
+        expect(first.receivedAt).toBeGreaterThanOrEqual(first.openedAt);
+        // Written to the port as well - the hook observes, it does not replace.
+        expect(sentTo(PORT_NAMES.staff)).toEqual(HANDSHAKE_FOR_LOG);
+        socket.close();
+    });
+
+    it('gives two sockets on one port two connection ids', async () => {
+        const seen = await bootWithHooks();
+        const a = await connect(`?t=${TOKEN}&port=staff`);
+        const b = await connect(`?t=${TOKEN}&port=staff`);
+        a.socket.send(JSON.stringify({ t: 0, b: [0x90, 60, 100] }));
+        b.socket.send(JSON.stringify({ t: 0, b: [0x90, 64, 100] }));
+        await settle();
+        expect(new Set(seen.messages.map((info) => info.connId)).size).toBe(2);
+        a.socket.close();
+        b.socket.close();
+    });
+
+    it('says why a frame was dropped', async () => {
+        const seen = await bootWithHooks();
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        socket.send('not json');
+        socket.send(JSON.stringify({ t: 0, b: [0xf0, 0x7e, 0xf7] }));
+        socket.send(JSON.stringify({ t: 0, b: [999] }));
+        socket.send(JSON.stringify({ b: [0x90, 60, 100] }));
+        await settle();
+
+        expect(seen.drops.map((drop) => drop.reason)).toEqual([
+            'not JSON',
+            'SysEx refused (0xF0 at b[0])',
+            'b[0] = 999 is not a MIDI byte (an integer 0-255)',
+            't is missing or not a finite number',
+        ]);
+        expect(seen.drops[0]).toMatchObject({ portName: PORT_NAMES.staff, raw: 'not json' });
+        expect(seen.messages).toEqual([]);
+        socket.close();
+    });
+
+    it('reports an oversize frame as a drop before the close', async () => {
+        const seen = await bootWithHooks();
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        const closed = new Promise((resolve) => socket.on('close', resolve));
+        socket.send('x'.repeat(MAX_FRAME_BYTES * 4));
+        await closed;
+        await settle();
+        expect(seen.drops.map((drop) => drop.reason)).toEqual([`frame larger than ${MAX_FRAME_BYTES} bytes, connection closed (1009)`]);
+        expect(seen.closes).toHaveLength(1);
+        expect(seen.closes[0].code).toBe(1009);
+    });
+
+    it('says when a connection closes, with the id its frames carried', async () => {
+        const seen = await bootWithHooks();
+        const { socket } = await connect(`?t=${TOKEN}&port=pads&client=browser`);
+        socket.send(JSON.stringify({ t: 0, b: [0x90, 60, 100] }));
+        await settle();
+        socket.close();
+        await settle();
+        expect(seen.closes).toHaveLength(1);
+        expect(seen.closes[0]).toMatchObject({
+            connId: seen.messages[0].connId,
+            portName: PORT_NAMES.pads,
+            claim: 'pads',
+            client: 'browser',
+        });
+        expect(seen.closes[0].closedAt).toBeGreaterThanOrEqual(seen.closes[0].openedAt);
+    });
+
+    it('keeps forwarding when a hook throws', async () => {
+        // A diagnostic that breaks must cost a log line, never the note.
+        await server.close();
+        port = ephemeralPort();
+        server = startServer({
+            port,
+            token: TOKEN,
+            ports,
+            version: 'x',
+            platform: 'darwin',
+            onMessage: () => {
+                throw new Error('log bug');
+            },
+        });
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        socket.send(JSON.stringify({ t: 0, b: [0x90, 60, 100] }));
+        socket.send(JSON.stringify({ t: 1, b: [0x80, 60, 0] }));
+        await settle();
+        expect(sentTo(PORT_NAMES.staff)).toEqual([
+            [0x90, 60, 100],
+            [0x80, 60, 0],
+        ]);
+        expect(socket.readyState).toBe(WebSocket.OPEN);
+        socket.close();
+    });
+});
+
+describe('ending what a closed socket left sounding', () => {
+    // A phone that locks, a tab that is closed, Wi-Fi that drops mid-chord:
+    // the socket ends with note-ons already in the DAW and their note-offs
+    // never coming. Nothing else would end them.
+
+    /** Waits for the server to have handled a close, which the client learns before it does. */
+    async function closeAndSettle(socket: WebSocket, how: 'close' | 'terminate' = 'close'): Promise<void> {
+        if (how === 'close') socket.close();
+        else socket.terminate();
+        await settle();
+    }
+
+    it('sends a NoteOff for every note it held, then the pedal up and All Notes Off on the channels it played', async () => {
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        for (const bytes of [
+            [0xb0, 64, 127],
+            [0x91, 60, 100],
+            [0x92, 64, 100],
+            [0x93, 67, 100],
+            [0x83, 67, 0],
+        ]) {
+            socket.send(JSON.stringify({ t: 0, b: bytes }));
+        }
+        await settle();
+        const before = sentTo(PORT_NAMES.staff).length;
+        await closeAndSettle(socket);
+
+        expect(sentTo(PORT_NAMES.staff).slice(before)).toEqual([
+            [0x81, 60, 0],
+            [0x82, 64, 0],
+            [0xb0, 64, 0],
+            [0xb0, 123, 0],
+            [0xb1, 64, 0],
+            [0xb1, 123, 0],
+            [0xb2, 64, 0],
+            [0xb2, 123, 0],
+            [0xb3, 64, 0],
+            [0xb3, 123, 0],
+        ]);
+    });
+
+    it('does the same when the socket dies rather than closing', async () => {
+        const { socket } = await connect(`?t=${TOKEN}&port=pads`);
+        socket.send(JSON.stringify({ t: 0, b: [0x91, 60, 100] }));
+        await settle();
+        await closeAndSettle(socket, 'terminate');
+        expect(sentTo(PORT_NAMES.pads)).toContainEqual([0x81, 60, 0]);
+        expect(sentTo(PORT_NAMES.pads).at(-1)).toEqual([0xb1, 123, 0]);
+    });
+
+    it('sends nothing when the socket ended its own notes and played nothing else', async () => {
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        for (const bytes of HANDSHAKE_FOR_LOG.slice(0, 6)) socket.send(JSON.stringify({ t: 0, b: bytes }));
+        await settle();
+        const before = sentTo(PORT_NAMES.staff).length;
+        await closeAndSettle(socket);
+        expect(sentTo(PORT_NAMES.staff).slice(before)).toEqual([]);
+    });
+
+    it("leaves another socket's notes on a shared port sounding", async () => {
+        const leaving = await connect(`?t=${TOKEN}&port=staff`);
+        const staying = await connect(`?t=${TOKEN}&port=staff`);
+        leaving.socket.send(JSON.stringify({ t: 0, b: [0x91, 60, 100] }));
+        leaving.socket.send(JSON.stringify({ t: 0, b: [0x92, 62, 100] }));
+        staying.socket.send(JSON.stringify({ t: 0, b: [0x91, 64, 100] }));
+        staying.socket.send(JSON.stringify({ t: 0, b: [0x92, 62, 100] }));
+        await settle();
+        const before = sentTo(PORT_NAMES.staff).length;
+        await closeAndSettle(leaving.socket);
+
+        const released = sentTo(PORT_NAMES.staff).slice(before);
+        // Its own note on ch 2 ends; 62 on ch 3 is the other socket's too, and
+        // both channels still carry the other socket's notes - so no NoteOff
+        // for 62 and no All Notes Off anywhere.
+        expect(released).toEqual([
+            [0x81, 60, 0],
+            [0xb1, 64, 0],
+            [0xb2, 64, 0],
+        ]);
+        expect(staying.socket.readyState).toBe(WebSocket.OPEN);
+
+        // And the one that stays is released in full when it goes.
+        await closeAndSettle(staying.socket);
+        expect(sentTo(PORT_NAMES.staff).slice(before + released.length)).toEqual([
+            [0x81, 64, 0],
+            [0x82, 62, 0],
+            [0xb1, 64, 0],
+            [0xb1, 123, 0],
+            [0xb2, 64, 0],
+            [0xb2, 123, 0],
+        ]);
+    });
+
+    it('reports what it sent to the log hook and in the disconnect event', async () => {
+        await server.close();
+        const closes: ConnectionCloseInfo[] = [];
+        const ended: number[] = [];
+        port = ephemeralPort();
+        server = startServer({
+            port,
+            token: TOKEN,
+            ports,
+            version: 'x',
+            platform: 'darwin',
+            onEvent: (event) => {
+                if (event.type === 'disconnected') ended.push(event.ended);
+            },
+            onConnectionClose: (info) => closes.push(info),
+        });
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        socket.send(JSON.stringify({ t: 0, b: [0x91, 60, 100] }));
+        await settle();
+        await closeAndSettle(socket);
+        expect(closes[0].released).toEqual([
+            [0x81, 60, 0],
+            [0xb1, 64, 0],
+            [0xb1, 123, 0],
+        ]);
+        expect(ended).toEqual([1]);
+    });
+
+    it('leaves the whole-port panic to the caller when the server itself is shutting down', async () => {
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        socket.send(JSON.stringify({ t: 0, b: [0x91, 60, 100] }));
+        await settle();
+        const before = sentTo(PORT_NAMES.staff).length;
+        await server.close();
+        await settle();
+        expect(sentTo(PORT_NAMES.staff).slice(before)).toEqual([]);
     });
 });
 

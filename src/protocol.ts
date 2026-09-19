@@ -108,13 +108,6 @@ export const CLOSE_BAD_CLAIM = 4002;
 export const CLOSE_NO_PORT = 4003;
 
 /**
- * Parses one inbound frame.
- *
- * Returns null rather than throwing for anything malformed: this is a socket
- * open to a local network, so a bad frame is a thing to drop, not a thing to
- * crash the helper somebody is playing through.
- */
-/**
  * The largest frame the server will read, in bytes.
  *
  * One message is one MIDI event - three bytes, or the six of an RPN - wrapped
@@ -129,32 +122,78 @@ export const MAX_FRAME_BYTES = 4096;
 const SYSEX_START = 0xf0;
 const SYSEX_END = 0xf7;
 
+/**
+ * Parses one inbound frame.
+ *
+ * Returns null rather than throwing for anything malformed: this is a socket
+ * open to a local network, so a bad frame is a thing to drop, not a thing to
+ * crash the helper somebody is playing through.
+ */
 export function parseMessage(raw: string): BridgeMessage | null {
+    const parsed = parseMessageDetailed(raw);
+    return parsed.ok ? parsed.message : null;
+}
+
+export type ParsedMessage = { ok: true; message: BridgeMessage } | { ok: false; reason: string };
+
+/**
+ * parseMessage, saying why when it drops a frame.
+ *
+ * The reason is for the --log-midi console and nothing else: the socket still
+ * gets no reply (see server.ts), so a broken client learns nothing new from it.
+ * It exists because "dropped" alone sends whoever is reading the log back to
+ * the source to find out which of eight rules the frame broke.
+ */
+export function parseMessageDetailed(raw: string): ParsedMessage {
     let value: unknown;
     try {
         value = JSON.parse(raw);
     } catch {
-        return null;
+        return { ok: false, reason: 'not JSON' };
     }
-    if (!value || typeof value !== 'object') return null;
+    if (!value || typeof value !== 'object') return { ok: false, reason: 'not a JSON object' };
     const message = value as Partial<BridgeMessage>;
-    if (typeof message.t !== 'number' || !Number.isFinite(message.t)) return null;
-    if (!Array.isArray(message.b) || message.b.length === 0) return null;
+    if (typeof message.t !== 'number' || !Number.isFinite(message.t)) {
+        return { ok: false, reason: 't is missing or not a finite number' };
+    }
+    if (!Array.isArray(message.b) || message.b.length === 0) return { ok: false, reason: 'b is missing or empty' };
 
     const bytes: number[] = [];
-    for (const byte of message.b) {
+    for (let index = 0; index < message.b.length; index++) {
+        const byte: unknown = message.b[index];
         // A MIDI byte is 0..255 and nothing else. Silently clamping would turn
         // a corrupt frame into a wrong note, which is harder to notice than no
         // note at all.
-        if (typeof byte !== 'number' || !Number.isInteger(byte) || byte < 0 || byte > 255) return null;
+        if (typeof byte !== 'number' || !Number.isInteger(byte) || byte < 0 || byte > 255) {
+            return { ok: false, reason: `b[${index}] = ${shortValue(byte)} is not a MIDI byte (an integer 0-255)` };
+        }
         // SysEx is refused outright. The app never sends it - it calls
         // requestMIDIAccess with SysEx off and emits no 0xF0 byte anywhere -
         // so a frame carrying one did not come from the app, and SysEx is the
         // one MIDI message that can reprogram, overwrite or brick hardware on
         // the other end of the port. Data bytes are all below 0x80, so either
         // byte appearing anywhere in a frame can only mean SysEx.
-        if (byte === SYSEX_START || byte === SYSEX_END) return null;
+        if (byte === SYSEX_START || byte === SYSEX_END) {
+            return { ok: false, reason: `SysEx refused (0x${byte.toString(16).toUpperCase()} at b[${index}])` };
+        }
         bytes.push(byte);
     }
-    return { t: message.t, b: bytes };
+    return { ok: true, message: { t: message.t, b: bytes } };
+}
+
+/** How much of a rejected value a drop reason quotes. */
+export const REASON_VALUE_CHARS = 40;
+
+/**
+ * A rejected value as the drop reason quotes it, cut to REASON_VALUE_CHARS.
+ *
+ * A frame is up to 4 KB and one entry of `b` can be most of it - a string, a
+ * nested object - so quoting it whole put a 4 KB line in the log for one bad
+ * frame. Forty characters says what the thing was; the raw frame, already cut
+ * short by the log, is there for anybody who needs more.
+ */
+function shortValue(value: unknown): string {
+    // JSON.stringify(undefined) is undefined, not a string - String() it.
+    const text = JSON.stringify(value) ?? String(value);
+    return text.length > REASON_VALUE_CHARS ? `${text.slice(0, REASON_VALUE_CHARS)}...` : text;
 }

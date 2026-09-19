@@ -9,7 +9,7 @@
 // web page can speak, and this end speaks MIDI because that is what Ableton can
 // hear. Nothing in between interprets the bytes.
 
-import { readFileSync } from 'node:fs';
+import { createWriteStream, readFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 import qrcode from 'qrcode-terminal';
@@ -18,6 +18,7 @@ import { createsVirtualPorts, listPorts, openPorts, type MidiBackend } from './p
 import { startServer } from './server.js';
 import { createToken, lanAddresses, pairingUrl } from './pairing.js';
 import { loadBackend } from './backend.js';
+import { MidiLogger, isMidiLogLevel, type MidiLogLevel } from './midiLog.js';
 
 // The site the QR code should open. NOT a placeholder, and it used to be one:
 // this is the fallback for every run that passes neither --app nor
@@ -42,9 +43,31 @@ interface Args {
     bind: string;
     quiet: boolean;
     help: boolean;
+    /**
+     * How much of every MIDI message to print, or null for none - the
+     * default, because a console scrolling with every bend is noise to
+     * somebody who only wants to play. Independent of --quiet, which is about
+     * the banner: a quiet start and a detailed log is a sensible combination.
+     */
+    logMidi: MidiLogLevel | null;
+    /** A JSON Lines file of every decoded message, or empty for none. */
+    logFile: string;
+    /** Values parseArgs could not use, said once at startup rather than ignored. */
+    warnings: string[];
+}
+
+/** TUTOR_BRIDGE_LOG_MIDI: a level, or a yes/no word meaning "all" or "off". */
+function logLevelFromEnv(raw: string | undefined, warnings: string[]): MidiLogLevel | null {
+    const value = raw?.trim().toLowerCase() ?? '';
+    if (value === '' || ['0', 'false', 'no', 'off'].includes(value)) return null;
+    if (isMidiLogLevel(value)) return value;
+    if (['1', 'true', 'yes', 'on'].includes(value)) return 'all';
+    warnings.push(`TUTOR_BRIDGE_LOG_MIDI=${raw}: not a level (notes, expr or all), using all`);
+    return 'all';
 }
 
 function parseArgs(argv: string[]): Args {
+    const warnings: string[] = [];
     const args: Args = {
         port: DEFAULT_PORT,
         token: '',
@@ -53,7 +76,11 @@ function parseArgs(argv: string[]): Args {
         bind: '',
         quiet: false,
         help: false,
+        logMidi: logLevelFromEnv(process.env.TUTOR_BRIDGE_LOG_MIDI, warnings),
+        logFile: '',
+        warnings,
     };
+    const unknownLevel = (level: string) => warnings.push(`--log-midi ${level}: not a level (notes, expr or all), using all`);
     for (let i = 0; i < argv.length; i++) {
         const flag = argv[i];
         const value = argv[i + 1];
@@ -64,6 +91,23 @@ function parseArgs(argv: string[]): Args {
         else if (flag === '--bind' && value) { args.bind = value; i++; }
         else if (flag === '--quiet') args.quiet = true;
         else if (flag === '--help' || flag === '-h') args.help = true;
+        else if (flag === '--log-midi') {
+            // Bare means everything: somebody who typed the flag with no
+            // level wants to see what arrives, not to pick a verbosity.
+            // A following word that is not another flag was meant as a
+            // level, so a typo in one is said rather than run as `all`
+            // with the word silently left over.
+            args.logMidi = 'all';
+            if (isMidiLogLevel(value)) { args.logMidi = value; i++; }
+            else if (value && !value.startsWith('-')) { unknownLevel(value); i++; }
+        }
+        else if (flag.startsWith('--log-midi=')) {
+            const level = flag.slice('--log-midi='.length);
+            if (isMidiLogLevel(level)) args.logMidi = level;
+            else { args.logMidi = 'all'; unknownLevel(level); }
+        }
+        else if (flag === '--log-file' && value) { args.logFile = value; i++; }
+        else if (flag.startsWith('--log-file=') && flag.length > '--log-file='.length) args.logFile = flag.slice('--log-file='.length);
     }
     return args;
 }
@@ -79,6 +123,17 @@ music-theory-midi-bridge - play a DAW on this computer from a phone
   --host <ip>    Advertise this address instead of guessing one
   --bind <ip>    Listen only on this interface (default: all of them)
   --quiet        No QR code, no banner
+  --log-midi[=<level>]
+                 Print every MIDI message the phone sends, decoded:
+                   notes  note on/off, MPE setup (MCM, RPN 0), sustain,
+                          all-notes-off, warnings, a summary per connection
+                   expr   notes + pitch bend, pressure, CC 74/1/11
+                          (a fast stream prints about ten lines a second)
+                   all    everything, every message, with its raw bytes
+                 Bare --log-midi means all. Also: TUTOR_BRIDGE_LOG_MIDI=<level>
+  --log-file <path>
+                 Append every decoded message to this file as JSON Lines
+                 (works with or without --log-midi)
   --help         This
 
 The phone connects over your local network, so both devices have to be on the
@@ -102,6 +157,35 @@ function loadVersion(): string {
     }
 }
 
+function describeLogging(args: Args): string {
+    const file = args.logFile ? `every message to ${args.logFile}` : '';
+    if (args.logMidi) return file ? `${args.logMidi}, and ${file}` : args.logMidi;
+    return file ? `off on screen; ${file}` : 'off  (--log-midi to print every message)';
+}
+
+/**
+ * A JSON Lines sink. Appends, so two runs pointed at one file keep both, and
+ * stops at the first write error rather than repeating it for every note.
+ */
+function openLogFile(path: string): { write(entry: Record<string, unknown>): void; end(done: () => void): void } {
+    const stream = createWriteStream(path, { flags: 'a' });
+    let failed = false;
+    stream.on('error', (error) => {
+        if (failed) return;
+        failed = true;
+        console.log(`  ! --log-file ${path}: ${error.message} - not logging to the file any more`);
+    });
+    return {
+        write: (entry) => {
+            if (!failed) stream.write(`${JSON.stringify(entry)}\n`);
+        },
+        end: (done) => {
+            if (failed) return done();
+            stream.end(done);
+        },
+    };
+}
+
 function banner(args: Args, token: string, ports: ReturnType<typeof openPorts>, version: string): void {
     const found = lanAddresses();
     // --host wins outright: it is somebody who already knows which of their
@@ -112,6 +196,10 @@ function banner(args: Args, token: string, ports: ReturnType<typeof openPorts>, 
     const virtual = createsVirtualPorts(process.platform);
 
     console.log(`\n  music-theory-midi-bridge ${version}\n`);
+    // Said up front, whatever else the banner says, because this is the line
+    // that tells somebody debugging MPE whether the console below will show
+    // them anything per message.
+    console.log(`  MIDI logging: ${describeLogging(args)}\n`);
 
     if (ports.open.size > 0) {
         console.log('  Ports open:');
@@ -193,6 +281,7 @@ function main(): void {
 
     const version = loadVersion();
     const token = args.token || createToken();
+    for (const warning of args.warnings) console.log(`  ! ${warning}`);
 
     let backend: MidiBackend;
     try {
@@ -223,6 +312,22 @@ function main(): void {
         console.log('');
     }
 
+    // Built only when asked for. With neither flag nothing per message is
+    // decoded, formatted or allocated, and the server gets no hooks at all.
+    const logFile = args.logFile ? openLogFile(args.logFile) : null;
+    const logger =
+        args.logMidi || logFile
+            ? new MidiLogger({ level: args.logMidi, platform: backend.platform, record: logFile?.write })
+            : null;
+    // Which socket a log line belongs to, on the connect line it matches.
+    const connTag = (connId: number) => (logger ? ` #${connId}` : '');
+    /**
+     * Set once shutdown has panicked every port. The sockets it then closes
+     * get no release of their own (server.ts skips it), so their summaries are
+     * told the panic ended their notes rather than calling them hanging.
+     */
+    let panicked = false;
+
     const server = startServer({
         port: args.port,
         bind: args.bind || undefined,
@@ -232,24 +337,54 @@ function main(): void {
         platform: backend.platform,
         onEvent: (event) => {
             if (args.quiet) return;
-            if (event.type === 'connected') console.log(`  + ${event.client} -> ${event.portName}`);
-            else if (event.type === 'disconnected') console.log(`  - ${event.portName}`);
+            if (event.type === 'connected') console.log(`  + ${event.client} -> ${event.portName}${connTag(event.connId)}`);
+            else if (event.type === 'disconnected') {
+                // Said, because it is the bridge acting on its own: without
+                // this line a note that stopped when a phone locked reads as
+                // the app having ended it.
+                const ended = event.ended > 0 ? `, ended ${event.ended} note(s) it left held` : '';
+                console.log(`  - ${event.portName}${connTag(event.connId)}${ended}`);
+            }
             else if (event.reason === 'token') console.log(`  ! refused ${event.detail}: wrong token`);
             else if (event.reason === 'port') console.log(`  ! refused: no port named ${event.detail}`);
             else console.log(`  ! refused: unknown instrument "${event.detail}"`);
         },
+        onMessage: logger ? (info) => logger.message(info) : undefined,
+        onDrop: logger ? (info) => logger.drop(info) : undefined,
+        onConnectionClose: logger ? (info) => logger.close({ ...info, shutdown: panicked }) : undefined,
     });
 
     const shutdown = () => {
         // Ports first: a DAW left with a held note because this exited without
         // closing them is the one failure a player would notice immediately.
+        // The pedal before All Notes Off: CC 123 ends notes the way their
+        // note-offs would, so a note under a pedal that is still down keeps
+        // sounding through it. (This covers every channel of every port, which
+        // is why the server skips each socket's own release while closing.)
         for (const port of ports.open.values()) {
             for (let channel = 0; channel < 16; channel++) {
+                port.send([0xb0 | channel, 64, 0]);
                 port.send([0xb0 | channel, 123, 0]);
             }
         }
+        // Every connection is on an open port, so this ended all of theirs.
+        panicked = ports.open.size > 0;
+        // These bytes never pass through the server, so the log says so
+        // itself - otherwise the last thing Ableton received is missing from
+        // the record of what it received.
+        if (args.logMidi && ports.open.size > 0) {
+            console.log(
+                `  shutting down: sent CC 64 Sustain off and CC 123 All Notes Off on ch 1-16 of ${[...ports.open.keys()].join(', ')}`
+            );
+        }
         ports.closeAll();
-        void server.close().then(() => process.exit(0));
+        void server.close().then(() => {
+            // Any connection whose close has not been reported yet still gets
+            // its summary, and the file gets its last lines before exit.
+            logger?.closeAll(performance.now(), panicked);
+            if (logFile) logFile.end(() => process.exit(0));
+            else process.exit(0);
+        });
     };
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
