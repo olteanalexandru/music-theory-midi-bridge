@@ -14,6 +14,10 @@
 // The one exception to "no opinion": when a socket closes, for any reason, it
 // ends what that socket left sounding (heldNotes.ts). A socket that dies
 // mid-note never gets to send its note-offs, and nothing else would.
+//
+// And a socket that dies WITHOUT closing - a phone out of Wi-Fi range, a
+// battery gone flat - is found by the heartbeat below and closed here, so
+// that release reaches it too.
 
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { IncomingMessage } from 'node:http';
@@ -61,12 +65,52 @@ export interface ServerOptions {
     onDrop?: (info: DropInfo) => void;
     /** Told when an accepted connection closes, so a log can sum it up. */
     onConnectionClose?: (info: ConnectionCloseInfo) => void;
+    /**
+     * How often to ping every accepted connection, in ms - see HEARTBEAT_MS.
+     * A parameter so a test can run it in milliseconds rather than seconds;
+     * 0 turns it off.
+     */
+    heartbeatMs?: number;
 }
+
+/**
+ * How often each connection is pinged.
+ *
+ * *** A PHONE THAT VANISHES SAYS NOTHING. ***
+ *
+ * Out of Wi-Fi range, battery flat, the app killed by the OS: no close frame
+ * is ever sent, and this server writes nothing after `hello`, so nothing
+ * here would ever fail and the socket stayed "open" - with every note it had
+ * started still sounding in the DAW - until Ctrl+C. A ping is a write, so it
+ * is what finds out.
+ *
+ * Browsers answer pings on their own, below the page: nothing in the app has
+ * to do anything, and a tab that is busy, backgrounded or throttled still
+ * answers, because its network stack is not.
+ *
+ * Ten seconds is long enough to cost nothing (a few bytes per connection) and
+ * short enough that a vanished phone's notes stop within half a minute.
+ */
+export const HEARTBEAT_MS = 10_000;
+
+/**
+ * Pings that may go unanswered in a row before the socket is terminated.
+ *
+ * Two rather than one, so one ping lost on a busy network is not a
+ * disconnection. A phone that is really gone is therefore dropped between
+ * 20 and 30 s after it went (two intervals, plus however far into the first
+ * one it vanished).
+ */
+export const MISSED_PONGS_ALLOWED = 2;
 
 export type ServerEvent =
     | { type: 'connected'; claim: Claim | null; portName: string; client: string; connId: number }
-    /** `ended`: how many notes that connection left held, which the close just sent NoteOffs for. */
-    | { type: 'disconnected'; claim: Claim | null; portName: string; connId: number; ended: number }
+    /**
+     * `ended`: how many notes that connection left held, which the close just
+     * sent NoteOffs for. `timedOut`: the bridge closed it itself, because it
+     * stopped answering pings - see HEARTBEAT_MS.
+     */
+    | { type: 'disconnected'; claim: Claim | null; portName: string; connId: number; ended: number; timedOut: boolean }
     | { type: 'refused'; reason: 'token' | 'claim' | 'port'; detail: string };
 
 /**
@@ -111,6 +155,12 @@ export interface ConnectionCloseInfo {
     closedAt: number;
     /** The WebSocket close code; 1009 is a frame over MAX_FRAME_BYTES. */
     code: number;
+    /**
+     * Terminated by the heartbeat: the other end stopped answering pings
+     * (HEARTBEAT_MS). `code` is then 1006, which on its own reads as any
+     * dropped network - this says the bridge is the one that noticed.
+     */
+    timedOut: boolean;
     /**
      * What the close wrote to the port to end what this connection left
      * sounding (see HeldNotes.releaseMessages), already sent by the time this
@@ -162,6 +212,8 @@ export function startServer(options: ServerOptions): RunningServer {
     // it is buffered - see MAX_FRAME_BYTES.
     const wss = new WebSocketServer({ port: options.port, host: options.bind, path: WS_PATH, maxPayload: MAX_FRAME_BYTES });
     const report = options.onEvent ?? (() => undefined);
+    /** See HEARTBEAT_MS. 0 turns it off, which is what a test that wants a socket held open asks for. */
+    const heartbeatMs = options.heartbeatMs ?? HEARTBEAT_MS;
 
     /**
      * The live sockets writing to each port, each as what it has left
@@ -267,6 +319,45 @@ export function startServer(options: ServerOptions): RunningServer {
         const portPeers = peers;
         portPeers.add(held);
 
+        /**
+         * The heartbeat, per accepted connection - see HEARTBEAT_MS.
+         *
+         * A ping is the only thing this server ever writes after `hello`, and
+         * therefore the only thing that can fail: without one, a phone that
+         * went out of range or had its battery die stayed "connected" with its
+         * notes sounding until Ctrl+C. Terminating is deliberate rather than
+         * closing politely - there is nobody left to complete a close
+         * handshake with - and it lands in the `close` handler below, which is
+         * what actually ends the notes.
+         *
+         * `unref` so a helper with a dead connection can still exit on its own
+         * if nothing else is holding the loop.
+         */
+        let timedOut = false;
+        let missedPongs = 0;
+        // Browsers answer pings below the page, so nothing in the app takes
+        // part in this and a backgrounded or throttled tab still replies.
+        socket.on('pong', () => {
+            missedPongs = 0;
+        });
+        const heartbeat =
+            heartbeatMs > 0
+                ? setInterval(() => {
+                      if (missedPongs >= MISSED_PONGS_ALLOWED) {
+                          timedOut = true;
+                          socket.terminate();
+                          return;
+                      }
+                      missedPongs += 1;
+                      try {
+                          socket.ping();
+                      } catch {
+                          // Already closing; `close` is on its way.
+                      }
+                  }, heartbeatMs)
+                : null;
+        heartbeat?.unref?.();
+
         socket.on('message', (data) => {
             // Read on arrival, not after port.send: the log's lead is measured
             // against it, and a slow port would otherwise count as network.
@@ -309,6 +400,7 @@ export function startServer(options: ServerOptions): RunningServer {
         let refusedWith: number | undefined;
 
         socket.on('close', (code: number) => {
+            if (heartbeat) clearInterval(heartbeat);
             // Out of the set first, so the release below is measured against
             // the OTHER sockets on this port only.
             portPeers.delete(held);
@@ -328,9 +420,10 @@ export function startServer(options: ServerOptions): RunningServer {
                 openedAt,
                 closedAt: performance.now(),
                 code: refusedWith ?? code,
+                timedOut,
                 released,
             });
-            report({ type: 'disconnected', claim, portName, connId, ended });
+            report({ type: 'disconnected', claim, portName, connId, ended, timedOut });
         });
 
         // A socket that errors is a socket that is closing; `close` reports it.

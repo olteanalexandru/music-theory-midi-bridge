@@ -343,7 +343,13 @@ function main(): void {
                 // this line a note that stopped when a phone locked reads as
                 // the app having ended it.
                 const ended = event.ended > 0 ? `, ended ${event.ended} note(s) it left held` : '';
-                console.log(`  - ${event.portName}${connTag(event.connId)}${ended}`);
+                // A device that vanished never said goodbye, so without this
+                // the line is indistinguishable from somebody pressing
+                // Disconnect - and the twenty-odd seconds it took to notice
+                // read as the bridge being slow rather than as the heartbeat
+                // doing its job.
+                const why = event.timedOut ? ' (stopped answering, dropped by the bridge)' : '';
+                console.log(`  - ${event.portName}${connTag(event.connId)}${why}${ended}`);
             }
             else if (event.reason === 'token') console.log(`  ! refused ${event.detail}: wrong token`);
             else if (event.reason === 'port') console.log(`  ! refused: no port named ${event.detail}`);

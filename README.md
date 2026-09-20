@@ -168,11 +168,17 @@ CC 123 (All Notes Off) on each channel it played a note or moved the pedal on.
 The console says so on the disconnect line: `- Tutor Staff, ended 2 note(s) it
 left held`.
 
-It acts when this computer learns the connection closed. A phone that simply
-vanishes - out of Wi-Fi range, battery flat - says nothing on its way out, and
-the bridge never writes to a connection after greeting it, so nothing here
-notices: those notes stay on until Ctrl+C (below). Locking the phone is not that
-case: the app sends its own note-offs as it goes to the background.
+A phone that simply **vanishes** - out of Wi-Fi range, battery flat, the app
+killed by the OS - says nothing on its way out, so there is no close for this
+computer to learn about. The bridge finds those itself: every accepted
+connection is pinged about every 10 seconds, and one that misses two pings in a
+row is dropped, which runs exactly the release above. A vanished phone's notes
+therefore stop 20-30 seconds after it went, rather than at Ctrl+C. Browsers
+answer pings on their own, below the page, so a tab that is busy, backgrounded
+or throttled still answers and is never dropped for being idle - and the
+console says which happened: `- Tutor Staff (stopped answering, dropped by the
+bridge)`. Locking the phone is not that case at all: the app sends its own
+note-offs as it goes to the background.
 
 Only that connection's notes. Two devices can share a port, and one of them
 leaving sends no NoteOff for a note the other is also holding, no pedal-up where

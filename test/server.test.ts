@@ -16,6 +16,7 @@ import {
     type DropInfo,
     type MessageInfo,
     type RunningServer,
+    type ServerEvent,
 } from '../src/server.js';
 import { openPorts, type MidiBackend, type MidiOutputPort } from '../src/ports.js';
 import {
@@ -641,5 +642,97 @@ describe('re-opening the port a client is about to use', () => {
         ]);
         first.socket.close();
         second.socket.close();
+    });
+});
+
+// A phone that vanishes WITHOUT closing - out of Wi-Fi range, battery flat,
+// the app killed by the OS - sends no close frame, and this server writes
+// nothing after `hello`, so nothing here would ever fail. The socket stayed
+// "open" with every note it had started still sounding in the DAW, until
+// Ctrl+C. A ping is a write, so it is what finds out.
+describe('the heartbeat', () => {
+    /** Milliseconds rather than seconds, so a test is a test and not a wait. */
+    const BEAT_MS = 25;
+    /** Two pings unanswered, then one more tick to act on it. */
+    const UNTIL_DROPPED = BEAT_MS * 3 + 80;
+
+    async function bootWithHeartbeat(heartbeatMs: number, onEvent?: (event: ServerEvent) => void) {
+        await server.close();
+        const made = fakeBackend('darwin', ALL_PORT_NAMES);
+        outputs = made.outputs;
+        ports = openPorts(made.backend, ALL_PORT_NAMES);
+        port = ephemeralPort();
+        server = startServer({ port, token: TOKEN, ports, version: 'x', platform: 'darwin', heartbeatMs, onEvent });
+    }
+
+    /**
+     * What an out-of-range phone looks like from here: the socket is simply
+     * never answered again. Pausing stops the client reading, so the ping is
+     * never parsed and `ws`'s own automatic pong never happens - without
+     * pretending to be a client that refuses to answer, which no real one is.
+     */
+    const vanish = (socket: WebSocket) => socket.pause();
+
+    const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    it('ends the notes a vanished connection left held', async () => {
+        await bootWithHeartbeat(BEAT_MS);
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        socket.send(JSON.stringify({ t: 0, b: [0x91, 60, 100] }));
+        await settle();
+
+        vanish(socket);
+        await wait(UNTIL_DROPPED);
+
+        // The release-on-close path, reached because the bridge closed it.
+        expect(sentTo(PORT_NAMES.staff)).toContainEqual([0x81, 60, 0]);
+        expect(server.connections()).toBe(0);
+        socket.terminate();
+    });
+
+    it('says it was the bridge that dropped it', async () => {
+        // Without this the line reads as somebody pressing Disconnect, and the
+        // twenty-odd seconds it took to notice read as the bridge being slow.
+        const events: ServerEvent[] = [];
+        await bootWithHeartbeat(BEAT_MS, (event) => events.push(event));
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        socket.send(JSON.stringify({ t: 0, b: [0x91, 60, 100] }));
+        await settle();
+
+        vanish(socket);
+        await wait(UNTIL_DROPPED);
+
+        expect(events.find((event) => event.type === 'disconnected')).toMatchObject({ ended: 1, timedOut: true });
+        socket.terminate();
+    });
+
+    it('stays out of a healthy connection’s way', async () => {
+        // `ws` answers pings on its own, exactly as a browser does below the
+        // page - so a connection that is simply idle is never dropped.
+        const events: ServerEvent[] = [];
+        await bootWithHeartbeat(BEAT_MS, (event) => events.push(event));
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        socket.send(JSON.stringify({ t: 0, b: [0x91, 60, 100] }));
+
+        await wait(BEAT_MS * 6 + 40);
+        expect(events.some((event) => event.type === 'disconnected')).toBe(false);
+        expect(server.connections()).toBe(1);
+
+        // And when it does go, it is not reported as a timeout.
+        socket.close();
+        await settle();
+        expect(events.find((event) => event.type === 'disconnected')).toMatchObject({ timedOut: false });
+    });
+
+    it('can be switched off', async () => {
+        await bootWithHeartbeat(0);
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        socket.send(JSON.stringify({ t: 0, b: [0x91, 60, 100] }));
+        await settle();
+
+        vanish(socket);
+        await wait(UNTIL_DROPPED);
+        expect(server.connections()).toBe(1);
+        socket.terminate();
     });
 });
