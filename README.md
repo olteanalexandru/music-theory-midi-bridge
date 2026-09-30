@@ -21,11 +21,11 @@ build: GitHub retired the last x64 macOS runner and a native MIDI addon cannot
 be cross-compiled from Apple Silicon, so an Intel Mac has to build from source
 (`npm install && npm run build && node dist/index.js`).
 
-> **`npx music-theory-midi-bridge` does not work yet.** This package has never
-> been published to npm — the registry returns a 404 for it — so the one-liner
-> that used to head this section sent everybody who tried it into an error. The
-> releases above are real and current. When 1.0.1 is published the line comes
-> back, here and on the app's download page, which gates it on the same fact.
+> **`npx music-theory-midi-bridge` does not work.** This package is not on
+> npm - the registry returns a 404 for it - so the one-liner that used to head
+> this section sent everybody who tried it into an error. Use a release build
+> above, or build from source. If it is ever published, the line comes back
+> here and on the app's download page, which shows it only once it works.
 
 It prints an address, a pairing token and a QR code. Scan the QR with the phone
 and it opens a pairing page with the connection already filled in — one tap to
@@ -33,7 +33,7 @@ connect, and it names any loopMIDI port it could not find. Every instrument
 picks the address up from there.
 
 ```
-  music-theory-midi-bridge 1.0.0
+  music-theory-midi-bridge 1.0.6
 
   MIDI logging: off  (--log-midi to print every message)
 
@@ -48,7 +48,22 @@ picks the address up from there.
   Token:    kfp7mqx2wnhd
 
   Scan this with the phone:
+
   [QR]
+  https://note-noodle.com/app/bridge?bridge=192.168.1.20%3A8532&t=kfp7mqx2wnhd
+
+  Your DAW has to switch MPE on for each Tutor port, once - none does it
+  by itself:
+    Ableton Live 12 (Intro too): Settings > Link, Tempo & MIDI > MIDI Ports,
+      each "In: Tutor ..." row: Track On, MPE On (leave its Out row off).
+      Then a MIDI track with MIDI From = that port, Monitor In.
+    Bitwig: add Generic > MIDI Keyboard on the port; in the instrument,
+      Use MPE on and PB Range 48 (a plug-in may need Force MPE Mode).
+    Logic (Mac): plug-in window, MIDI Mono Mode = On (with common base
+      channel 1) and Mono Mode Pitch Range 48.
+    REAPER: Ctrl+P > Audio > MIDI Input Devices, enable the port; put the
+      plug-in in MPE mode with a 48-semitone bend range.
+  Check: hold two notes and bend one. Only that one should move.
 ```
 
 ---
@@ -127,17 +142,74 @@ port's channels.
 | Theremin | `Tutor Theremin` | track 3 |
 | Playable staff | `Tutor Staff` | track 4 |
 
-In Ableton, per track:
-
-1. **MIDI From** → the port for that instrument.
-2. Arm the track (the record button on it).
-3. **Preferences → Link/Tempo/MIDI** → find that port under *MIDI Ports* and
-   turn on **MPE**. Without this Live reads the per-note bends as one part-wide
-   bend, and a chord will slide as a block instead of per note.
+In the DAW, one track per instrument, each with **MIDI From** set to its port and
+MPE switched on for that port - see the next section.
 
 The bridge passes MIDI clock through like anything else, but the app does not
 send any at the moment (the pad grid's sequencer that did was retired), so
 Live keeps its own tempo.
+
+---
+
+## Set your DAW up for MPE, once
+
+The app announces its MPE zone on every port it plays into: the MPE
+Configuration Message, then a 48-semitone bend range on each member channel and
+2 on the master. It sends that when it connects, again before the first note
+after a few seconds of quiet, and every ten seconds or so while it sits idle -
+so it does not matter whether the DAW or the app was started first.
+
+No DAW acts on it by itself, though. Live, Bitwig, Logic and REAPER all leave a
+new port plain until MPE is switched on for it, none of them turns it on from
+the MCM, and none of them speaks MIDI-CI yet. (Push 3 needs no setup only
+because Live recognises Push 3 itself; nothing on a MIDI port can ask for that.)
+So it is one setting per port, once. The startup banner prints the short form;
+the app's pairing page (`/app/bridge`) has the same steps.
+
+**Ableton Live 12** (Intro included):
+
+1. **Options → Settings** (on a Mac, **Live → Settings**) → **Link, Tempo & MIDI**
+   → *MIDI Ports*.
+2. On each `In: Tutor …` row you play into, turn **Track** and **MPE** on. Leave
+   Sync and Remote off, and leave the port's `Out` row off: on Windows a loopMIDI
+   port sends whatever Live plays out straight back in.
+3. A MIDI track with **MIDI From** set to the port. With MPE on, the channel is
+   fixed to *All Channels*.
+4. **Monitor** on *In*, or on *Auto* with the track armed.
+5. Any Live 12 instrument plays MPE - Drift, for one. For a plug-in, right-click
+   its title bar → **Enable MPE Mode**.
+
+Without step 2 Live reads the per-note bends as one part-wide bend, and a chord
+slides as a block instead of per note. To see what was recorded, open the clip
+and switch it to the *MPE* view.
+
+**Bitwig Studio:** Dashboard → Settings → Controllers → Add Controller → Generic
+→ **MIDI Keyboard**, with its input set to the Tutor port (one per port). Give an
+instrument track that controller as its note input, and in the instrument's
+Inspector turn **Use MPE** on and set **PB Range** to 48. A plug-in that does
+not switch over by itself: right-click its device header → **Force MPE Mode**.
+
+**Logic Pro** (Mac, where the bridge makes its own ports - no loopMIDI): in the
+plug-in window's extended parameters (the disclosure triangle at the bottom
+left), set **MIDI Mono Mode** to *On (with common base channel 1)* and **Mono
+Mode Pitch Range** to 48. Logic Pro 12 can also switch Mono Mode on for every
+instrument it loads, in one global setting.
+
+**REAPER 7:** Ctrl+P → Audio → **MIDI Input Devices** (*MIDI Devices* before
+7.20) → right-click the port → **Enable input**. Set the track's record input to
+MIDI → the port → *All channels*, arm it and turn monitoring on, and put the
+plug-in in MPE mode with a 48-semitone bend range. REAPER has no MPE switch of
+its own and passes the app's setup through untouched, so VST2, CLAP and AU
+plug-ins read it themselves; a VST3 plug-in may never see it, so set its range
+by hand.
+
+Keep the app on the lower zone, its default: Logic needs base channel 1, and
+it is what Live's MPE input expects. If you changed the bend range in the app,
+use that number instead of 48.
+
+**To check it:** hold two notes and bend one. Only that one should move; if both
+bend, MPE is still off for that port. `--log-midi` (below) shows the setup
+arriving as `MCM: lower zone, 15 member channels` and the RPN 0 lines after it.
 
 ---
 
@@ -272,7 +344,7 @@ use - read the last line first:
 
 ```
 19:05:00.120 [Tutor Staff #1] MPE SUMMARY  android-app, 47.8 s, 1834 message(s) in 1834 frame(s)
-19:05:00.120 [Tutor Staff #1]     MCM            lower zone, 15 member channel(s) (ch 2-16); 1 MCM(s), before the first note
+19:05:00.120 [Tutor Staff #1]     MCM            lower zone, 15 member channel(s) (ch 2-16); 4 MCM(s), before the first note
 19:05:00.120 [Tutor Staff #1]     RPN 0 range    ch 1 = 2 st; ch 2-16 = 48 st
 19:05:00.120 [Tutor Staff #1]     members used   ch 2-7 (6 of 15)
 19:05:00.120 [Tutor Staff #1]     master         ch 1: NoteOn 0  NoteOff 0  PB 0  CC74 0  CC1 12  CC11 0  ChanPressure 0  PolyPressure 0
@@ -288,6 +360,8 @@ before the MCM, notes on the master channel, notes still held when the socket
 closed that the bridge could not end (another device on the port still holds
 them), dropped frames. With MPE off in the app the last
 line reads `MPE: not used (plain MIDI)`, which is correct for plain MIDI.
+Several MCMs on one connection are normal: the app repeats its MPE setup after
+a few seconds of quiet, so a DAW opened late still gets it before the next note.
 
 **Levels.**
 
@@ -388,6 +462,11 @@ shared `Tutor MIDI` port.
 
 Sent *before* any refusal, because `missing` is what lets the app say which
 loopMIDI port to create rather than just going quiet.
+
+After that the helper writes nothing but a WebSocket **ping** every 10 seconds,
+and a connection that leaves two in a row unanswered is dropped - see
+[When the phone goes away mid-note](#when-the-phone-goes-away-mid-note).
+Browsers answer pings on their own; any other client has to answer them too.
 
 Close codes: `4001` bad token, `4002` unknown claim, `4003` no such port.
 

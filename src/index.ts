@@ -186,6 +186,37 @@ function openLogFile(path: string): { write(entry: Record<string, unknown>): voi
     };
 }
 
+/**
+ * The DAW's half of MPE, printed under the QR code.
+ *
+ * The app announces its MPE zone on every port it plays into - the MCM and
+ * the RPN 0 bend ranges, on connect and again whenever it has been quiet -
+ * but no DAW acts on that by itself. Live, Bitwig, Logic and REAPER all leave
+ * a new port plain until somebody switches MPE on for it, none of them turns
+ * it on from the MCM, and none speaks MIDI-CI; Push 3 gets it for free only
+ * because Live recognises Push 3 itself. So the one step nothing can take for
+ * the player is said here, where they are already looking, with the menu
+ * names the current versions use (Live 12 calls it Settings, not
+ * Preferences). The app's /app/bridge page has the same steps at length.
+ *
+ * Each line fits an 80-column console with the banner's two-space indent.
+ * Exported so a test holds them to that and to the names.
+ */
+export const DAW_SETUP_LINES: readonly string[] = [
+    'Your DAW has to switch MPE on for each Tutor port, once - none does it',
+    'by itself:',
+    '  Ableton Live 12 (Intro too): Settings > Link, Tempo & MIDI > MIDI Ports,',
+    '    each "In: Tutor ..." row: Track On, MPE On (leave its Out row off).',
+    '    Then a MIDI track with MIDI From = that port, Monitor In.',
+    '  Bitwig: add Generic > MIDI Keyboard on the port; in the instrument,',
+    '    Use MPE on and PB Range 48 (a plug-in may need Force MPE Mode).',
+    '  Logic (Mac): plug-in window, MIDI Mono Mode = On (with common base',
+    '    channel 1) and Mono Mode Pitch Range 48.',
+    '  REAPER: Ctrl+P > Audio > MIDI Input Devices, enable the port; put the',
+    '    plug-in in MPE mode with a 48-semitone bend range.',
+    'Check: hold two notes and bend one. Only that one should move.',
+];
+
 function banner(args: Args, token: string, ports: ReturnType<typeof openPorts>, version: string): void {
     const found = lanAddresses();
     // --host wins outright: it is somebody who already knows which of their
@@ -268,8 +299,8 @@ function banner(args: Args, token: string, ports: ReturnType<typeof openPorts>, 
     console.log('\n  Scan this with the phone:\n');
     qrcode.generate(url, { small: true }, (code: string) => console.log(code));
     console.log(`  ${url}\n`);
-    console.log('  In Ableton, set each track\'s MIDI From to one of the ports above,');
-    console.log('  arm it, and turn on MPE for that port in Preferences > Link/MIDI.\n');
+    for (const line of DAW_SETUP_LINES) console.log(`  ${line}`);
+    console.log('');
 }
 
 function main(): void {
@@ -289,7 +320,9 @@ function main(): void {
     } catch (error) {
         console.error('\n  Could not load the MIDI bindings.\n');
         console.error(`  ${error instanceof Error ? error.message : String(error)}\n`);
-        console.error('  Running from npx? Node 20 or newer is needed.');
+        // Not "from npx": the package is not on npm (see the README), so the
+        // one way to get here with the wrong Node is a build from source.
+        console.error('  Running from source? Node 20 or newer is needed.');
         console.error('  Running a downloaded build? Please report this with the line above:');
         console.error('  https://github.com/olteanalexandru/music-theory-midi-bridge/issues\n');
         process.exitCode = 1;
@@ -403,4 +436,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     main();
 }
 
-export { CLAIMS, PORT_NAMES, DEFAULT_APP_ORIGIN, parseArgs };
+export { CLAIMS, PORT_NAMES, DEFAULT_APP_ORIGIN, parseArgs, banner };
