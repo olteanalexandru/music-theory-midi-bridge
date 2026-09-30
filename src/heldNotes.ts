@@ -9,11 +9,14 @@
 // still holding), but a socket that simply dies has no way out, and a synth
 // left droning is the failure a player notices first.
 //
-// Only a close this machine hears about, though. The server writes nothing
-// after its hello and sets no keepalive, so a phone that vanishes without a
-// word (out of Wi-Fi range) leaves a socket that never closes here, and its
-// notes are ended only by the shutdown panic. A heartbeat would catch it, at
-// the price of also dropping a phone that sleeps with the page open.
+// Only a close this machine hears about, though - and a phone that vanishes
+// without a word (out of Wi-Fi range, battery flat) sends none. That is what
+// the server's heartbeat is for (HEARTBEAT_MS in server.ts): every accepted
+// socket is pinged every 10 s, and one that misses two pongs in a row is
+// terminated, which closes it here like any other close and runs the release
+// below - so a vanished phone's notes end 20-30 s after it went, instead of
+// at the shutdown panic. A browser answers pings below the page, so a tab
+// that is merely idle, throttled or backgrounded is never dropped by it.
 //
 // Per connection, never per port. Two devices really can share a port (see
 // `live` in server.ts), each with its own MPE allocator on the same channels,
