@@ -186,6 +186,66 @@ function observe<T>(hook: ((info: T) => void) | undefined, info: T): void {
     }
 }
 
+/** The most of a client's own label, or of a claim it was refused, that is ever printed. */
+export const MAX_CLIENT_LABEL = 64;
+
+/** The most of a dropped frame that is quoted - midiLog's own cap for its file. */
+export const MAX_RAW_QUOTE = 256;
+
+/**
+ * Controls (C0, DEL and C1), format characters (the bidi overrides and
+ * isolates, zero-width marks, the BOM), line and paragraph separators, and
+ * lone surrogates. Everything a terminal acts on rather than shows.
+ */
+const UNPRINTABLE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cs}]/u;
+
+/**
+ * A string that came off the network, made safe to put in a terminal.
+ *
+ * `client`, a refused claim and a dropped frame all reach console.log, and
+ * the first two arrive BEFORE the token is checked - so anyone who can reach
+ * the port could print to this terminal: `?client=%1B%5D52%3Bc%3B...%07` set
+ * the operator's clipboard through OSC 52, `%1B%5B2J` wiped the screen for a
+ * forged banner or QR code, and `%0A` forged whole log lines. Each of those
+ * is now shown as its escape (`\x1b`), never acted on, so a strange label
+ * still reads as strange rather than vanishing. Capped too, because the
+ * header limit is about 16 KB and a label is a word or two.
+ *
+ * Done once, where the value is read, so every reader - the console, the
+ * MIDI log and its file - gets the same clean string.
+ */
+export function printable(value: string, max: number): string {
+    let out = '';
+    // Counted in what is PRINTED, escapes included, so `max` bounds the line.
+    let shown = 0;
+    for (const char of value) {
+        const code = char.codePointAt(0) ?? 0;
+        const escape = !UNPRINTABLE.test(char)
+            ? null
+            : code <= 0xff
+              ? `\\x${code.toString(16).padStart(2, '0')}`
+              : `\\u{${code.toString(16)}}`;
+        const width = escape ? escape.length : 1;
+        if (shown + width > max) return `${out}…`;
+        out += escape ?? char;
+        shown += width;
+    }
+    return out;
+}
+
+/**
+ * The drop reason for a frame `ws` refused as invalid WebSocket.
+ *
+ * ws builds the message from fixed text and numbers (an opcode, a close
+ * code), so today no client can put a character into it. It goes through
+ * printable anyway, because it is printed beside strings that can, and the
+ * day a ws release quotes the frame it read, this is the line that would
+ * carry it. A function of its own so a test can hold it to that.
+ */
+export function invalidFrameReason(message: string): string {
+    return printable(`invalid WebSocket frame, connection closed (${message})`, MAX_RAW_QUOTE);
+}
+
 export interface RunningServer {
     close(): Promise<void>;
     /** Open sockets, for tests and for the banner. */
@@ -241,7 +301,8 @@ export function startServer(options: ServerOptions): RunningServer {
         const url = new URL(request.url ?? WS_PATH, 'http://localhost');
         const token = url.searchParams.get('t') ?? '';
         const claimParam = url.searchParams.get('port');
-        const client = url.searchParams.get('client') ?? 'unknown';
+        // Printable here, before the token check reports it - see printable.
+        const client = printable(url.searchParams.get('client') ?? 'unknown', MAX_CLIENT_LABEL);
 
         if (!tokensMatch(token, options.token)) {
             report({ type: 'refused', reason: 'token', detail: client });
@@ -254,7 +315,7 @@ export function startServer(options: ServerOptions): RunningServer {
         let claim: Claim | null = null;
         if (claimParam !== null && claimParam !== '') {
             if (!isClaim(claimParam)) {
-                report({ type: 'refused', reason: 'claim', detail: claimParam });
+                report({ type: 'refused', reason: 'claim', detail: printable(claimParam, MAX_CLIENT_LABEL) });
                 socket.close(CLOSE_BAD_CLAIM, 'unknown port claim');
                 return;
             }
@@ -368,7 +429,15 @@ export function startServer(options: ServerOptions): RunningServer {
             // bug somewhere, and replying to it would only give a broken client
             // something else to get wrong.
             if (!parsed.ok) {
-                observe(onDrop, { connId, portName, reason: parsed.reason, raw });
+                // Both quote the frame: `raw` whole, and the reason a value
+                // out of it, through JSON.stringify, which leaves C1 controls
+                // and the bidi overrides alone.
+                observe(onDrop, {
+                    connId,
+                    portName,
+                    reason: printable(parsed.reason, MAX_RAW_QUOTE),
+                    raw: printable(raw, MAX_RAW_QUOTE),
+                });
                 return;
             }
             port.send(parsed.message.b);
@@ -437,7 +506,11 @@ export function startServer(options: ServerOptions): RunningServer {
                 observe(onDrop, { connId, portName, reason: `frame larger than ${MAX_FRAME_BYTES} bytes, connection closed (1009)` });
                 return;
             }
-            observe(onDrop, { connId, portName, reason: `invalid WebSocket frame, connection closed (${error.message})` });
+            observe(onDrop, {
+                connId,
+                portName,
+                reason: invalidFrameReason(error.message),
+            });
         });
     });
 

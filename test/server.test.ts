@@ -11,6 +11,10 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import WebSocket from 'ws';
 import {
+    MAX_CLIENT_LABEL,
+    MAX_RAW_QUOTE,
+    invalidFrameReason,
+    printable,
     startServer,
     type ConnectionCloseInfo,
     type DropInfo,
@@ -734,5 +738,152 @@ describe('the heartbeat', () => {
         await wait(UNTIL_DROPPED);
         expect(server.connections()).toBe(1);
         socket.terminate();
+    });
+});
+
+// *** WHAT A CLIENT SAYS ABOUT ITSELF REACHES A TERMINAL. ***
+//
+// `client` is printed by index.ts on every connect, and on a wrong token too -
+// which is before anything is authenticated, so anybody who can reach the
+// port could write to the operator's terminal: an OSC 52 sequence that sets
+// the clipboard, a screen clear and a forged banner or QR, newlines that forge
+// log lines. These pin that every string the network supplies arrives at the
+// events and hooks as text that prints as itself, and short.
+describe('strings from the network, on their way to a terminal', () => {
+    /** A backslash, spelled so no tool on the way can read it as an escape. */
+    const BS = String.fromCharCode(92);
+    const cp = (code: number) => String.fromCodePoint(code);
+    /** Nothing a terminal would act on: C0, DEL, C1, bidi/format, separators. */
+    function hasControl(text: string): boolean {
+        return [...text].some((char) => {
+            const n = char.codePointAt(0) ?? 0;
+            return (
+                n < 0x20 ||
+                (n >= 0x7f && n <= 0x9f) ||
+                (n >= 0x200b && n <= 0x200f) ||
+                (n >= 0x2028 && n <= 0x202e) ||
+                (n >= 0x2060 && n <= 0x2069) ||
+                n === 0xfeff ||
+                (n >= 0xd800 && n <= 0xdfff)
+            );
+        });
+    }
+    // ESC ] 52 ; c ; AAAA BEL, then a newline and a forged connect line.
+    const OSC52 = '%1B%5D52%3Bc%3BAAAA%07%0A%2B%20fake%20-%3E%20Tutor%20Staff';
+
+    async function bootWithEvents(): Promise<{ events: ServerEvent[]; drops: DropInfo[]; messages: MessageInfo[] }> {
+        await server.close();
+        const seen = { events: [] as ServerEvent[], drops: [] as DropInfo[], messages: [] as MessageInfo[] };
+        port = ephemeralPort();
+        server = startServer({
+            port,
+            token: TOKEN,
+            ports,
+            version: 'x',
+            platform: 'darwin',
+            onEvent: (event) => seen.events.push(event),
+            onDrop: (info) => seen.drops.push(info),
+            onMessage: (info) => seen.messages.push(info),
+        });
+        return seen;
+    }
+
+    it('shows the escapes in a refused client rather than passing them to the terminal, with no token needed', async () => {
+        const seen = await bootWithEvents();
+        const { code } = await connect(`?t=wrong&client=${OSC52}`);
+        expect(code).toBe(CLOSE_BAD_TOKEN);
+        await settle();
+        const refused = seen.events.find((event) => event.type === 'refused');
+        expect(refused).toMatchObject({ reason: 'token' });
+        const detail = (refused as { detail: string }).detail;
+        expect(hasControl(detail)).toBe(false);
+        // Shown, not deleted: an odd label should still look odd in the log.
+        expect(detail).toBe(`${BS}x1b]52;c;AAAA${BS}x07${BS}x0a+ fake -> Tutor Staff`);
+    });
+
+    it('caps a refused client at a label’s length', async () => {
+        const seen = await bootWithEvents();
+        await connect(`?t=wrong&client=${'a'.repeat(5000)}`);
+        await settle();
+        const refused = seen.events.find((event) => event.type === 'refused') as { detail: string };
+        expect(refused.detail).toBe(`${'a'.repeat(MAX_CLIENT_LABEL)}…`);
+    });
+
+    it('escapes C1 controls, bidi overrides, line separators and lone surrogates, which JSON and a C0-only filter both miss', () => {
+        // U+009B is CSI on its own in an 8-bit terminal; U+202E reverses what
+        // follows; U+2028 is a line break to some terminals and log viewers.
+        expect(printable(`a${cp(0x9b)}2Jb${cp(0x202e)}c${cp(0x2028)}d${cp(0x2066)}e`, MAX_CLIENT_LABEL)).toBe(`a${BS}x9b2Jb${BS}u{202e}c${BS}u{2028}d${BS}u{2066}e`);
+        expect(printable(`${cp(0xd800)}x`, MAX_CLIENT_LABEL)).toBe(`${BS}u{d800}x`);
+    });
+
+    it('leaves an ordinary label alone, accents and middle dots included', () => {
+        for (const label of ['android-app', 'browser', 'Pixel 8 · Chrome 129', 'Studioul lui Ștefan']) {
+            expect(printable(label, MAX_CLIENT_LABEL)).toBe(label);
+        }
+        expect(printable('', MAX_CLIENT_LABEL)).toBe('');
+    });
+
+    it('cleans the client on an accepted connection too, for the connect line and the MIDI log', async () => {
+        const seen = await bootWithEvents();
+        const { socket } = await connect(`?t=${TOKEN}&port=staff&client=${OSC52}`);
+        socket.send(JSON.stringify({ t: 0, b: [0x90, 60, 100] }));
+        await settle();
+        const connected = seen.events.find((event) => event.type === 'connected') as { client: string };
+        expect(hasControl(connected.client)).toBe(false);
+        expect(seen.messages[0].client).toBe(connected.client);
+        socket.close();
+    });
+
+    it('cleans a refused claim, which is printed in quotes', async () => {
+        const seen = await bootWithEvents();
+        const { code } = await connect(`?t=${TOKEN}&port=%1B%5B2J${'x'.repeat(300)}`);
+        expect(code).toBe(CLOSE_BAD_CLAIM);
+        await settle();
+        const refused = seen.events.find((event) => event.type === 'refused') as { reason: string; detail: string };
+        expect(refused.reason).toBe('claim');
+        expect(hasControl(refused.detail)).toBe(false);
+        expect(refused.detail.startsWith(`${BS}x1b[2J`)).toBe(true);
+        expect([...refused.detail].length).toBe(MAX_CLIENT_LABEL + 1);
+    });
+
+    it('cleans a dropped frame and the reason quoting it', async () => {
+        const seen = await bootWithEvents();
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        socket.send(`${cp(0x1b)}[2J not json`);
+        // JSON.stringify inside the reason escapes C0 but not C1.
+        socket.send(JSON.stringify({ t: 0, b: [`${cp(0x9b)}2J`] }));
+        await settle();
+        expect(seen.drops).toHaveLength(2);
+        for (const drop of seen.drops) {
+            expect(hasControl(drop.reason)).toBe(false);
+            expect(hasControl(drop.raw ?? '')).toBe(false);
+        }
+        expect(seen.drops[0].raw).toBe(`${BS}x1b[2J not json`);
+        expect(seen.drops[1].reason).toContain(`${BS}x9b2J`);
+        socket.close();
+    });
+
+    it('reports a frame ws refused as invalid, through the same cleaning', async () => {
+        const seen = await bootWithEvents();
+        const { socket } = await connect(`?t=${TOKEN}&port=staff`);
+        const closed = new Promise((resolve) => socket.on('close', resolve));
+        // FIN + RSV2 + text, masked, empty: ws refuses it before the payload.
+        // The ws client never sends one, so it goes onto the TCP socket raw.
+        (socket as unknown as { _socket: { write(bytes: Buffer): void } })._socket.write(Buffer.from([0xa1, 0x80, 0, 0, 0, 0]));
+        await closed;
+        await settle();
+        expect(seen.drops.map((drop) => drop.reason)).toEqual([
+            'invalid WebSocket frame, connection closed (Invalid WebSocket frame: RSV2 and RSV3 must be clear)',
+        ]);
+    });
+
+    it('escapes and caps the invalid-frame reason, should ws ever quote what it read', () => {
+        // No client can reach this text today (ws writes fixed strings and
+        // numbers); this holds the guard in place for the day one can.
+        const reason = invalidFrameReason(`bad ${cp(0x1b)}[2J${cp(0x202e)}${'x'.repeat(500)}`);
+        expect(hasControl(reason)).toBe(false);
+        expect(reason.startsWith(`invalid WebSocket frame, connection closed (bad ${BS}x1b[2J${BS}u{202e}x`)).toBe(true);
+        expect([...reason].length).toBe(MAX_RAW_QUOTE + 1);
+        expect(reason.endsWith('…')).toBe(true);
     });
 });
