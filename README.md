@@ -442,6 +442,14 @@ ws://<host>:8532/midi?t=<token>&port=<claim>&client=<label>
 `claim` is one of `stylophone`, `pads`, `theremin`, `staff`, or absent for the
 shared `Tutor MIDI` port.
 
+`client` is a short label for the connection log, and it is untrusted: the
+helper prints control and format characters in it as visible escapes (for
+example `\x1b`) and caps the printed label at 64 characters. A refused
+claim's detail gets the same treatment. A dropped frame's text and reason,
+and the reason for a frame `ws` refused as an invalid WebSocket frame
+(`invalidFrameReason`), are cleaned the same way and capped at 256
+characters.
+
 **App → helper**, one JSON object per MIDI message:
 
 ```json
