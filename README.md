@@ -33,7 +33,7 @@ connect, and it names any loopMIDI port it could not find. Every instrument
 picks the address up from there.
 
 ```
-  music-theory-midi-bridge 1.0.6
+  music-theory-midi-bridge 1.0.7
 
   MIDI logging: off  (--log-midi to print every message)
 
