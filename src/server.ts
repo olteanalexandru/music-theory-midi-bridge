@@ -18,25 +18,44 @@
 // And a socket that dies WITHOUT closing - a phone out of Wi-Fi range, a
 // battery gone flat - is found by the heartbeat below and closed here, so
 // that release reaches it too.
+//
+// Since 1.0.8 the same port also answers FILE_WS_PATH, where a paired client
+// sends a take to be written into the takes folder (files.ts). That is a
+// second WebSocketServer behind one HTTP server, so the MIDI path keeps its
+// own MAX_FRAME_BYTES and nothing about it changes.
 
-import { WebSocketServer, type WebSocket } from 'ws';
-import type { IncomingMessage } from 'node:http';
+import WebSocket, { WebSocketServer, type RawData } from 'ws';
+import { createServer, STATUS_CODES, type IncomingMessage } from 'node:http';
+import type { Duplex } from 'node:stream';
 import {
     CLOSE_BAD_CLAIM,
     CLOSE_BAD_TOKEN,
+    CLOSE_BUSY,
     CLOSE_NO_PORT,
     DEFAULT_PORT_NAME,
+    FILE_CAPABILITIES,
+    FILE_WS_PATH,
+    FILES_PER_MINUTE,
+    MAX_FILE_CONNECTIONS,
+    MAX_FILE_PAYLOAD,
     MAX_FRAME_BYTES,
     PORT_NAMES,
     PROTOCOL_VERSION,
+    REFUSED_MAX_PAYLOAD,
     WS_PATH,
     isClaim,
+    parseFileHeader,
     parseMessageDetailed,
     type Claim,
+    type FileErrorCode,
+    type FileHelloMessage,
+    type FileReply,
     type HelloMessage,
+    type TakeExtension,
 } from './protocol.js';
 import type { PortSet } from './ports.js';
 import { HeldNotes } from './heldNotes.js';
+import { RateLimiter, cleanTakeName, looksLike, maxBytesFor, saveTake } from './files.js';
 
 export interface ServerOptions {
     port: number;
@@ -71,7 +90,31 @@ export interface ServerOptions {
      * 0 turns it off.
      */
     heartbeatMs?: number;
+    /**
+     * The folder FILE_WS_PATH writes takes into, absolute (files.ts works it
+     * out from --takes-dir). Absent, the path is not served at all and the
+     * hello offers no `files` - which is what every test that is not about
+     * files gets, so none of them can write into a real Documents folder.
+     */
+    takesDir?: string;
+    /**
+     * How long a FILE_WS_PATH socket may receive nothing at all before it is
+     * closed - see FILE_IDLE_MS. A parameter for the same reason heartbeatMs is.
+     */
+    fileIdleMs?: number;
 }
+
+/**
+ * How long a file socket may go without a single byte arriving.
+ *
+ * Not the heartbeat. A 32 MiB WAV over a slow Wi-Fi link is one WebSocket
+ * message that can take longer than the heartbeat's twenty seconds, and a
+ * browser cannot slip a pong into the middle of it - so pings would drop
+ * exactly the uploads that are working. Bytes arriving is the sign of life
+ * instead, and a socket that has had none for a minute is gone or forgotten
+ * and is holding one of MAX_FILE_CONNECTIONS.
+ */
+export const FILE_IDLE_MS = 60_000;
 
 /**
  * How often each connection is pinged.
@@ -111,7 +154,12 @@ export type ServerEvent =
      * stopped answering pings - see HEARTBEAT_MS.
      */
     | { type: 'disconnected'; claim: Claim | null; portName: string; connId: number; ended: number; timedOut: boolean }
-    | { type: 'refused'; reason: 'token' | 'claim' | 'port'; detail: string };
+    /** `busy`: FILE_WS_PATH only, MAX_FILE_CONNECTIONS already open. */
+    | { type: 'refused'; reason: 'token' | 'claim' | 'port' | 'busy'; detail: string }
+    /** A take written into the takes folder, under `name` (printable already). */
+    | { type: 'file-saved'; fileId: number; client: string; name: string; bytes: number }
+    /** A take that was not, and why; `detail` is the name or header asked for, printable. */
+    | { type: 'file-refused'; fileId: number; client: string; code: FileErrorCode; detail: string };
 
 /**
  * One forwarded frame, with everything the server knows about it.
@@ -248,9 +296,28 @@ export function invalidFrameReason(message: string): string {
 
 export interface RunningServer {
     close(): Promise<void>;
-    /** Open sockets, for tests and for the banner. */
+    /** Open MIDI sockets, for tests and for the banner. */
     connections(): number;
+    /** Open FILE_WS_PATH sockets. */
+    fileConnections(): number;
 }
+
+/** The path of a request URL, compared exactly as `ws` compares its own `path`. */
+function pathOf(url: string | undefined): string {
+    const value = url ?? '';
+    const query = value.indexOf('?');
+    return query === -1 ? value : value.slice(0, query);
+}
+
+/** A message as one Buffer, whatever shape `ws` handed it over in. */
+function toBuffer(data: RawData): Buffer {
+    if (Buffer.isBuffer(data)) return data;
+    if (Array.isArray(data)) return Buffer.concat(data);
+    return Buffer.from(data);
+}
+
+/** The most of a requested file name or header that is quoted in the console. */
+export const MAX_NAME_QUOTE = 128;
 
 /**
  * Constant-time-ish comparison for the token.
@@ -268,10 +335,56 @@ function tokensMatch(given: string, expected: string): boolean {
 }
 
 export function startServer(options: ServerOptions): RunningServer {
+    // The HTTP server `ws` used to make for itself, made here so a second
+    // path can share the port. A plain request gets what `ws` answered it
+    // with, 426 Upgrade Required.
+    const http = createServer((_request, response) => {
+        const body = STATUS_CODES[426] ?? 'Upgrade Required';
+        response.writeHead(426, { 'Content-Length': body.length, 'Content-Type': 'text/plain' });
+        response.end(body);
+    });
     // maxPayload: a frame past it is refused by `ws` itself (close 1009) before
     // it is buffered - see MAX_FRAME_BYTES.
-    const wss = new WebSocketServer({ port: options.port, host: options.bind, path: WS_PATH, maxPayload: MAX_FRAME_BYTES });
+    const wss = new WebSocketServer({ noServer: true, path: WS_PATH, maxPayload: MAX_FRAME_BYTES });
+    // Its own cap, and only when there is a folder to write into.
+    const takesDir = options.takesDir;
+    const files = takesDir ? new WebSocketServer({ noServer: true, path: FILE_WS_PATH, maxPayload: MAX_FILE_PAYLOAD }) : null;
+    // Where a file socket that is turned away is sent to be closed: it reads
+    // no more than REFUSED_MAX_PAYLOAD, so the 32 MiB cap above is only ever
+    // open to somebody holding the token.
+    const refuser = new WebSocketServer({ noServer: true, maxPayload: REFUSED_MAX_PAYLOAD });
     const report = options.onEvent ?? (() => undefined);
+    const fileIdleMs = options.fileIdleMs ?? FILE_IDLE_MS;
+    let lastFileId = 0;
+
+    http.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
+        if (files && pathOf(request.url) === FILE_WS_PATH) {
+            const url = new URL(request.url ?? FILE_WS_PATH, 'http://localhost');
+            const client = printable(url.searchParams.get('client') ?? 'unknown', MAX_CLIENT_LABEL);
+            const refuse = (code: number, reason: string) =>
+                refuser.handleUpgrade(request, socket, head, (refused) => {
+                    refused.on('error', () => undefined);
+                    refused.close(code, reason);
+                });
+            // Before the upgrade, unlike /midi: the cap behind it is 32 MiB.
+            if (!tokensMatch(url.searchParams.get('t') ?? '', options.token)) {
+                report({ type: 'refused', reason: 'token', detail: client });
+                refuse(CLOSE_BAD_TOKEN, 'bad token');
+                return;
+            }
+            if (files.clients.size >= MAX_FILE_CONNECTIONS) {
+                report({ type: 'refused', reason: 'busy', detail: client });
+                refuse(CLOSE_BUSY, 'too many file connections');
+                return;
+            }
+            files.handleUpgrade(request, socket, head, (accepted) => files.emit('connection', accepted, request));
+            return;
+        }
+        // Everything else exactly as when `ws` owned the server: /midi is
+        // accepted, any other path is answered 400 by handleUpgrade itself.
+        wss.handleUpgrade(request, socket, head, (accepted) => wss.emit('connection', accepted, request));
+    });
+    http.listen(options.port, options.bind);
     /** See HEARTBEAT_MS. 0 turns it off, which is what a test that wants a socket held open asks for. */
     const heartbeatMs = options.heartbeatMs ?? HEARTBEAT_MS;
 
@@ -363,6 +476,8 @@ export function startServer(options: ServerOptions): RunningServer {
             portName,
             ports: [...options.ports.open.keys()],
             missing: options.ports.missing,
+            // Its presence is the capability - see HelloMessage.files.
+            ...(files ? { files: FILE_CAPABILITIES } : {}),
         };
         socket.send(JSON.stringify(hello));
 
@@ -514,13 +629,129 @@ export function startServer(options: ServerOptions): RunningServer {
         });
     });
 
+    /**
+     * FILES_PER_MINUTE, shared by every FILE_WS_PATH socket. The token is the
+     * pairing, and one bridge run has one token, so this is one per pairing.
+     * Not per socket: the app opens a fresh socket for every file it sends,
+     * so a per-socket count never reached its limit and only
+     * MAX_FILE_CONNECTIONS held anyone back. Each file announced counts
+     * (refused ones included), and one over the limit is answered
+     * `rate-limited` and its body dropped unread.
+     */
+    const limiter = new RateLimiter(FILES_PER_MINUTE, 60_000);
+
+    /**
+     * A take, sent to be written into the takes folder - see FILE_WS_PATH in
+     * protocol.ts for the steps and files.ts for what is and is not written.
+     * The token was checked before this socket was accepted.
+     */
+    files?.on('connection', (socket: WebSocket, request: IncomingMessage) => {
+        const fileId = ++lastFileId;
+        const url = new URL(request.url ?? FILE_WS_PATH, 'http://localhost');
+        const client = printable(url.searchParams.get('client') ?? 'unknown', MAX_CLIENT_LABEL);
+        const hello: FileHelloMessage = { hello: PROTOCOL_VERSION, version: options.version, files: FILE_CAPABILITIES };
+        socket.send(JSON.stringify(hello));
+
+        /** What the next binary message is: a take, one to drop unread, or nothing announced. */
+        let pending: { stem: string; ext: TakeExtension; name: string; size: number } | 'skip' | null = null;
+        /** Replies go out in the order the files came in, however long each write takes. */
+        let queue: Promise<void> = Promise.resolve();
+        const inOrder = (step: () => Promise<void> | void) => {
+            queue = queue.then(step).catch(() => undefined);
+        };
+        const reply = (message: FileReply) => {
+            if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+        };
+        const refuse = (code: FileErrorCode, detail: string, max?: number) =>
+            inOrder(() => {
+                report({ type: 'file-refused', fileId, client, code, detail });
+                reply(max === undefined ? { error: code } : { error: code, max });
+            });
+
+        // See FILE_IDLE_MS. On the TCP socket, so a large message that is
+        // still arriving counts as alive.
+        const raw = request.socket;
+        let idle: ReturnType<typeof setTimeout> | null = null;
+        const touch = () => {
+            if (idle) clearTimeout(idle);
+            if (fileIdleMs <= 0) return;
+            idle = setTimeout(() => socket.terminate(), fileIdleMs);
+            idle.unref?.();
+        };
+        touch();
+        raw.on('data', touch);
+
+        socket.on('message', (data: RawData, isBinary: boolean) => {
+            const bytes = toBuffer(data);
+            if (!isBinary) {
+                // A header. Whatever it announces replaces anything pending,
+                // and until it is accepted its body is one to drop unread.
+                pending = 'skip';
+                if (!limiter.take()) return refuse('rate-limited', '');
+                const text = bytes.toString('utf8');
+                const parsed = parseFileHeader(text);
+                if (!parsed.ok) return refuse(parsed.code, printable(text, MAX_NAME_QUOTE));
+                const clean = cleanTakeName(parsed.header.name);
+                if (!clean.ok) return refuse(clean.code, printable(parsed.header.name, MAX_NAME_QUOTE));
+                const max = maxBytesFor(clean.ext);
+                if (parsed.header.size > max) return refuse('too-large', printable(clean.name, MAX_NAME_QUOTE), max);
+                pending = { stem: clean.stem, ext: clean.ext, name: clean.name, size: parsed.header.size };
+                return;
+            }
+            const take = pending;
+            pending = null;
+            // The body of a header already refused, and answered: dropped unread.
+            if (take === 'skip') return;
+            if (take === null) {
+                if (!limiter.take()) return refuse('rate-limited', '');
+                return refuse('no-header', '');
+            }
+            const name = printable(take.name, MAX_NAME_QUOTE);
+            if (bytes.length !== take.size) return refuse('size-mismatch', name);
+            if (!looksLike(take.ext, bytes)) return refuse('bad-content', name);
+            inOrder(async () => {
+                const result = await saveTake(takesDir as string, take, bytes);
+                if ('saved' in result) {
+                    report({ type: 'file-saved', fileId, client, name: printable(result.saved, MAX_NAME_QUOTE), bytes: result.bytes });
+                } else {
+                    report({ type: 'file-refused', fileId, client, code: result.error, detail: name });
+                }
+                reply(result);
+            });
+        });
+
+        // A message over MAX_FILE_PAYLOAD: `ws` closes with 1009 by itself,
+        // and says so here first.
+        socket.on('error', (error: Error & { code?: string }) => {
+            if (error.code !== 'WS_ERR_UNSUPPORTED_MESSAGE_LENGTH') return;
+            report({
+                type: 'file-refused',
+                fileId,
+                client,
+                code: 'too-large',
+                detail: `a message over ${MAX_FILE_PAYLOAD} bytes, connection closed (1009)`,
+            });
+        });
+        socket.on('close', () => {
+            if (idle) clearTimeout(idle);
+            raw.off('data', touch);
+        });
+    });
+
     return {
         connections: () => wss.clients.size,
+        fileConnections: () => files?.clients.size ?? 0,
         close: () =>
             new Promise<void>((resolve) => {
                 shuttingDown = true;
                 for (const client of wss.clients) client.terminate();
-                wss.close(() => resolve());
+                for (const client of files?.clients ?? []) client.terminate();
+                for (const client of refuser.clients) client.terminate();
+                wss.close();
+                files?.close();
+                refuser.close();
+                http.closeAllConnections();
+                http.close(() => resolve());
             }),
     };
 }
