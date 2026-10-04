@@ -174,3 +174,20 @@ describe('--log-midi', () => {
         });
     });
 });
+
+describe('--takes-dir', () => {
+    it('is empty by default, which means Documents/Note Noodle/Takes', () => {
+        expect(parseArgs([]).takesDir).toBe('');
+    });
+
+    it('takes a folder, either way of writing it, spaces and all', () => {
+        expect(parseArgs(['--takes-dir', 'D:\\Music\\Live Takes']).takesDir).toBe('D:\\Music\\Live Takes');
+        expect(parseArgs(['--takes-dir=~/Music/Takes']).takesDir).toBe('~/Music/Takes');
+        expect(parseArgs(['--takes-dir', 'takes', '--port', '9000'])).toMatchObject({ takesDir: 'takes', port: 9000 });
+    });
+
+    it('ignores the flag with nothing after it rather than taking the next one', () => {
+        expect(parseArgs(['--takes-dir']).takesDir).toBe('');
+        expect(parseArgs(['--takes-dir=']).takesDir).toBe('');
+    });
+});
