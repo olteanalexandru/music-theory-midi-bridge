@@ -15,10 +15,11 @@ import { dirname, join } from 'node:path';
 import qrcode from 'qrcode-terminal';
 import { ALL_PORT_NAMES, CLAIMS, DEFAULT_PORT, PORT_NAMES } from './protocol.js';
 import { createsVirtualPorts, listPorts, openPorts, type MidiBackend } from './ports.js';
-import { startServer } from './server.js';
+import { startServer, type ServerEvent } from './server.js';
 import { createToken, lanAddresses, pairingUrl } from './pairing.js';
 import { loadBackend } from './backend.js';
 import { MidiLogger, isMidiLogLevel, type MidiLogLevel } from './midiLog.js';
+import { resolveTakesDir } from './files.js';
 
 // The site the QR code should open. NOT a placeholder, and it used to be one:
 // this is the fallback for every run that passes neither --app nor
@@ -52,6 +53,11 @@ interface Args {
     logMidi: MidiLogLevel | null;
     /** A JSON Lines file of every decoded message, or empty for none. */
     logFile: string;
+    /**
+     * Where a take sent from the app is written, as typed; empty means
+     * Documents/Note Noodle/Takes under the home folder. See files.ts.
+     */
+    takesDir: string;
     /** Values parseArgs could not use, said once at startup rather than ignored. */
     warnings: string[];
 }
@@ -78,6 +84,7 @@ function parseArgs(argv: string[]): Args {
         help: false,
         logMidi: logLevelFromEnv(process.env.TUTOR_BRIDGE_LOG_MIDI, warnings),
         logFile: '',
+        takesDir: '',
         warnings,
     };
     const unknownLevel = (level: string) => warnings.push(`--log-midi ${level}: not a level (notes, expr or all), using all`);
@@ -108,6 +115,8 @@ function parseArgs(argv: string[]): Args {
         }
         else if (flag === '--log-file' && value) { args.logFile = value; i++; }
         else if (flag.startsWith('--log-file=') && flag.length > '--log-file='.length) args.logFile = flag.slice('--log-file='.length);
+        else if (flag === '--takes-dir' && value) { args.takesDir = value; i++; }
+        else if (flag.startsWith('--takes-dir=') && flag.length > '--takes-dir='.length) args.takesDir = flag.slice('--takes-dir='.length);
     }
     return args;
 }
@@ -134,6 +143,10 @@ music-theory-midi-bridge - play a DAW on this computer from a phone
   --log-file <path>
                  Append every decoded message to this file as JSON Lines
                  (works with or without --log-midi)
+  --takes-dir <path>
+                 Where 'Send to PC' in the app saves a take (default:
+                 Documents/Note Noodle/Takes in your home folder; made on
+                 the first save). Add it to your DAW's browser once.
   --help         This
 
 The phone connects over your local network, so both devices have to be on the
@@ -217,6 +230,27 @@ export const DAW_SETUP_LINES: readonly string[] = [
     'Check: hold two notes and bend one. Only that one should move.',
 ];
 
+/**
+ * Under the takes folder's line in the banner: what it is for, and the one
+ * step that makes it useful. A drag from Chrome into Live cannot work on
+ * Windows (protocol.ts, FILE_WS_PATH); a drag from Live's own browser can.
+ * Exported so a test holds each to 80 columns with the banner's indent.
+ */
+export const TAKES_LINES: readonly string[] = [
+    "'Send to PC' in Take Studio saves here; the folder is made on the first",
+    "save. Add it to your DAW's browser once (Live: Places > Add Folder...)",
+    'and drag takes from there.',
+];
+
+/** A file event as the console prints it. Every string in it is printable already (server.ts). */
+export function fileEventLine(event: Extract<ServerEvent, { type: 'file-saved' | 'file-refused' }>): string {
+    if (event.type === 'file-saved') {
+        const size = event.bytes < 1024 ? `${event.bytes} bytes` : `${(event.bytes / 1024).toFixed(1)} KB`;
+        return `  > saved ${event.name} (${size}) from ${event.client}`;
+    }
+    return `  ! not saved, from ${event.client}: ${event.code}${event.detail ? ` (${event.detail})` : ''}`;
+}
+
 function banner(args: Args, token: string, ports: ReturnType<typeof openPorts>, version: string): void {
     const found = lanAddresses();
     // --host wins outright: it is somebody who already knows which of their
@@ -230,7 +264,12 @@ function banner(args: Args, token: string, ports: ReturnType<typeof openPorts>, 
     // Said up front, whatever else the banner says, because this is the line
     // that tells somebody debugging MPE whether the console below will show
     // them anything per message.
-    console.log(`  MIDI logging: ${describeLogging(args)}\n`);
+    console.log(`  MIDI logging: ${describeLogging(args)}`);
+    // Before anything that can return early: a machine with no ports and no
+    // network can still be told where its takes would go.
+    console.log(`  Takes folder: ${resolveTakesDir(args.takesDir)}`);
+    if (!args.quiet) for (const line of TAKES_LINES) console.log(`    ${line}`);
+    console.log('');
 
     if (ports.open.size > 0) {
         console.log('  Ports open:');
@@ -368,9 +407,11 @@ function main(): void {
         ports,
         version,
         platform: backend.platform,
+        takesDir: resolveTakesDir(args.takesDir),
         onEvent: (event) => {
             if (args.quiet) return;
-            if (event.type === 'connected') console.log(`  + ${event.client} -> ${event.portName}${connTag(event.connId)}`);
+            if (event.type === 'file-saved' || event.type === 'file-refused') console.log(fileEventLine(event));
+            else if (event.type === 'connected') console.log(`  + ${event.client} -> ${event.portName}${connTag(event.connId)}`);
             else if (event.type === 'disconnected') {
                 // Said, because it is the bridge acting on its own: without
                 // this line a note that stopped when a phone locked reads as
@@ -386,6 +427,7 @@ function main(): void {
             }
             else if (event.reason === 'token') console.log(`  ! refused ${event.detail}: wrong token`);
             else if (event.reason === 'port') console.log(`  ! refused: no port named ${event.detail}`);
+            else if (event.reason === 'busy') console.log(`  ! refused ${event.detail}: too many files being sent at once`);
             else console.log(`  ! refused: unknown instrument "${event.detail}"`);
         },
         onMessage: logger ? (info) => logger.message(info) : undefined,

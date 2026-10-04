@@ -33,9 +33,13 @@ connect, and it names any loopMIDI port it could not find. Every instrument
 picks the address up from there.
 
 ```
-  music-theory-midi-bridge 1.0.7
+  music-theory-midi-bridge 1.0.8
 
   MIDI logging: off  (--log-midi to print every message)
+  Takes folder: C:\Users\you\Documents\Note Noodle\Takes
+    'Send to PC' in Take Studio saves here; the folder is made on the first
+    save. Add it to your DAW's browser once (Live: Places > Add Folder...)
+    and drag takes from there.
 
   Ports open:
     - Tutor MIDI
@@ -265,6 +269,52 @@ Stopping the bridge itself (Ctrl+C) sends sustain off and All Notes Off on all
 
 ---
 
+## Send a take to this PC
+
+A take cannot be dragged from the browser straight into Ableton on Windows:
+Chrome hands a dragged download over as a file that only exists once the drop
+target runs Explorer's own handshake, and Live does not. Dropping on the
+desktop or a folder works; dropping on Live does not, and nothing on the page
+can change that.
+
+So the bridge writes the file instead. With the app connected to it, **Send to
+PC** in Take Studio saves the take into a folder on this computer - from the
+phone too:
+
+- **Windows:** `Documents\Note Noodle\Takes` in your user folder
+- **Mac and Linux:** `~/Documents/Note Noodle/Takes`
+- **Anywhere else:** `--takes-dir <path>` (a leading `~` is your home folder)
+
+The banner prints the folder, and it is made on the first save. Add it to your
+DAW's browser once - in Live, **Places > Add Folder...** - and drag takes from
+there: that is a real file on disk, which Live takes like any other.
+
+What it writes, and what it will not:
+
+- Only `.mid`, `.midi`, `.musicxml`, `.xml` and `.wav`, and only when the
+  bytes are that kind of file (`MThd`, `RIFF`...`WAVE`, or XML).
+- MIDI and MusicXML up to **2 MiB** (2,097,152 bytes); WAV up to **32 MiB**
+  (33,554,432 bytes), about three minutes of 16-bit stereo.
+- Never over an existing file: a second `take.mid` is saved as `take (2).mid`,
+  then `take (3).mid`.
+- Only a cleaned name, in that folder and nowhere else: a name that is a path
+  (`/`, `\`, a drive letter, `..`) or carries control characters is refused;
+  symbols become `_`; letters in any language are kept; a Windows device name
+  such as `CON` or `NUL` gets a `_` in front; it is cut at 100 characters
+  (or 200 UTF-8 bytes, whichever comes first).
+- At most 10 takes a minute in all (every connection counts towards the same 10,
+  refused ones included), and 4 connections sending at once.
+- The same pairing token as the instruments. Without it nothing is written.
+
+A MIDI file brings its notes into every DAW. Whether per-note MPE comes with it
+depends on the DAW, and Live very likely builds no editable note expression
+from an imported file. For that, use **Send to DAW** in Take Studio: it plays
+the take out over MIDI (this bridge, or the browser's own MIDI) from the
+start, after a one-bar count-in, into a Live track with MPE on that is
+recording - and Live records it as real per-note MPE.
+
+---
+
 ## Options
 
 ```
@@ -277,6 +327,8 @@ Stopping the bridge itself (Ctrl+C) sends sustain off and All Notes Off on all
 --log-midi[=<level>]  Print every MIDI message, decoded: notes, expr or all
                       (bare --log-midi means all)
 --log-file <path>     Append every decoded message to <path> as JSON Lines
+--takes-dir <path>    Where 'Send to PC' saves takes
+                      (default Documents/Note Noodle/Takes in your home folder)
 --help
 ```
 
@@ -296,9 +348,10 @@ tether, and those are two different addresses on this machine. Pass one to shut
 the others out - `--bind 127.0.0.1` accepts only a browser on this computer.
 
 The token is not decoration. This is a socket open to your local network that
-injects MIDI into whatever your machine is running, so a device without the
-token is refused. A fresh one is generated per run; `--token` pins it if you want
-a QR code that keeps working across restarts.
+injects MIDI into whatever your machine is running, and writes takes into one
+folder on it, so a device without the token is refused. A fresh one is
+generated per run; `--token` pins it if you want a QR code that keeps working
+across restarts.
 
 ---
 
@@ -477,6 +530,54 @@ and a connection that leaves two in a row unanswered is dropped - see
 Browsers answer pings on their own; any other client has to answer them too.
 
 Close codes: `4001` bad token, `4002` unknown claim, `4003` no such port.
+
+The MIDI hello also carries `files` from 1.0.8 - see below. Its presence is
+how the app knows it may offer **Send to PC**; an older helper sends none.
+
+### Sending a take (1.0.8)
+
+A path of its own, so the MIDI path keeps its 4096-byte frame cap:
+
+```
+ws://<host>:8532/file?t=<token>&client=<label>
+```
+
+The token is checked before the upgrade completes: a wrong one gets a socket
+that reads at most 1024 bytes and is closed with `4001`. A fifth file socket
+while four are open is closed with `4004`. One that receives no bytes at all
+for a minute is closed.
+
+**Helper → app**, on connect (the same `files` is in the MIDI hello):
+
+```json
+{ "hello": 1, "version": "1.0.8",
+  "files": { "path": "/file", "perMinute": 10,
+             "maxBytes": { "mid": 2097152, "midi": 2097152, "musicxml": 2097152,
+                           "xml": 2097152, "wav": 33554432 } } }
+```
+
+**App → helper**, per take: a text message with the name and size, then the
+bytes as one binary message.
+
+```json
+{ "name": "staff-120bpm-12notes.mid", "size": 5321 }
+```
+
+**Helper → app**, per take, in the order they were sent:
+
+```json
+{ "saved": "staff-120bpm-12notes (2).mid", "bytes": 5321 }
+{ "error": "too-large", "max": 2097152 }
+```
+
+`saved` is the name actually written, after cleaning and numbering. Error
+codes, which are stable: `bad-header`, `bad-name`, `bad-extension`, `empty`,
+`too-large` (with `max`), `no-header`, `size-mismatch`, `bad-content`,
+`rate-limited`, `folder-unavailable`, `name-taken`, `write-failed`. A header
+that is refused is answered at once and the binary message after it is dropped
+unanswered; a single message over 32 MiB closes the socket with `1009`.
+The requested name, the client label and the saved name are printed through
+the same escaping and caps as the MIDI path's.
 
 JSON rather than binary frames on purpose: a helper in any language can read it
 with its standard library, the traffic is a few hundred bytes a second even under
