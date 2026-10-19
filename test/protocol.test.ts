@@ -131,15 +131,45 @@ describe('the port table, which is the Ableton routing', () => {
         }
     });
 
-    it('recognises only the four instruments', () => {
+    it('names the ports exactly, because the app and loopMIDI both spell them', () => {
+        // The app's SequenceExport, download page, /instruments diagram and
+        // loopMIDI step list these names word for word; its
+        // bridgePortNames.test.ts reads this table from this file.
+        expect(PORT_NAMES).toEqual({
+            stylophone: 'Tutor Stylophone',
+            pads: 'Tutor Pads',
+            theremin: 'Tutor Theremin',
+            staff: 'Tutor Staff',
+            guitar: 'Tutor Guitar',
+            bassNeck: 'Tutor Bass',
+        });
+        expect(ALL_PORT_NAMES).toEqual([
+            'Tutor MIDI',
+            'Tutor Stylophone',
+            'Tutor Pads',
+            'Tutor Theremin',
+            'Tutor Staff',
+            'Tutor Guitar',
+            'Tutor Bass',
+        ]);
+    });
+
+    it('recognises only the six instruments, spelled as the app spells them', () => {
+        expect(CLAIMS).toEqual(['stylophone', 'pads', 'theremin', 'staff', 'guitar', 'bassNeck']);
         expect(isClaim('staff')).toBe(true);
+        expect(isClaim('guitar')).toBe(true);
+        expect(isClaim('bassNeck')).toBe(true);
+        // The Bass page's Pads view claims 'pads'; 'bass' was never a claim.
         expect(isClaim('bass')).toBe(false);
+        expect(isClaim('bassneck')).toBe(false);
         expect(isClaim('')).toBe(false);
         expect(isClaim(null)).toBe(false);
     });
 
     it('has a page for every claim', () => {
         for (const claim of CLAIMS) expect(CLAIM_PATHS[claim]).toMatch(/^\/app\//);
+        expect(CLAIM_PATHS.guitar).toBe('/app/guitar');
+        expect(CLAIM_PATHS.bassNeck).toBe('/app/bass');
     });
 });
 

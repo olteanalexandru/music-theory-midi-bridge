@@ -103,6 +103,10 @@ export const CLAIM_PATHS: Record<Claim, string> = {
     pads: '/app/pads',
     theremin: '/app/theremin',
     staff: '/app/playable-staff',
+    guitar: '/app/guitar',
+    // The Bass page's neck view. Not an instrument page of its own in the
+    // app's INSTRUMENT_PATHS: it is a view of /app/bass.
+    bassNeck: '/app/bass',
 };
 
 export function pairingUrl({ host, port, token, appOrigin }: PairingLink): string {
