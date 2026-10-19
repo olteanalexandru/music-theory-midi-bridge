@@ -33,7 +33,7 @@ connect, and it names any loopMIDI port it could not find. Every instrument
 picks the address up from there.
 
 ```
-  music-theory-midi-bridge 1.0.8
+  music-theory-midi-bridge 1.0.9
 
   MIDI logging: off  (--log-midi to print every message)
   Takes folder: C:\Users\you\Documents\Note Noodle\Takes
@@ -47,6 +47,8 @@ picks the address up from there.
     - Tutor Pads
     - Tutor Theremin
     - Tutor Staff
+    - Tutor Guitar
+    - Tutor Bass
 
   Address:  192.168.1.20:8532
   Token:    kfp7mqx2wnhd
@@ -88,6 +90,8 @@ So on Windows the ports have to exist before this can use them:
    - `Tutor Pads`
    - `Tutor Theremin`
    - `Tutor Staff`
+   - `Tutor Guitar` (helper 1.0.9 and later)
+   - `Tutor Bass` (helper 1.0.9 and later)
    - `Tutor MIDI`
 3. Run the bridge again.
 
@@ -142,12 +146,19 @@ port's channels.
 | Instrument | Port | Set this as the Live track's *MIDI From* |
 | --- | --- | --- |
 | Stylophone | `Tutor Stylophone` | track 1 |
-| Pad grid / Bass | `Tutor Pads` | track 2 |
+| Pad grid, and the Bass page's Pads view | `Tutor Pads` | track 2 |
 | Theremin | `Tutor Theremin` | track 3 |
 | Playable staff | `Tutor Staff` | track 4 |
+| Guitar (from 1.0.9) | `Tutor Guitar` | track 5 |
+| Bass neck, the Bass page's Neck view (from 1.0.9) | `Tutor Bass` | track 6 |
 
 In the DAW, one track per instrument, each with **MIDI From** set to its port and
 MPE switched on for that port - see the next section.
+
+The Guitar and the Bass neck claim `guitar` and `bassNeck`, which a helper
+before 1.0.9 does not know: it closes their socket with `4002` (unknown claim)
+and they do not connect, while every other instrument works as before. Update
+the helper to play them into a DAW.
 
 The bridge passes MIDI clock through like anything else, but the app does not
 send any at the moment (the pad grid's sequencer that did was retired), so
@@ -492,8 +503,9 @@ For anyone reimplementing either end. Connect to:
 ws://<host>:8532/midi?t=<token>&port=<claim>&client=<label>
 ```
 
-`claim` is one of `stylophone`, `pads`, `theremin`, `staff`, or absent for the
-shared `Tutor MIDI` port.
+`claim` is one of `stylophone`, `pads`, `theremin`, `staff`, `guitar` and
+`bassNeck` (both from 1.0.9: `Tutor Guitar` and `Tutor Bass`), or absent for
+the shared `Tutor MIDI` port. An unknown claim is closed with `4002`.
 
 `client` is a short label for the connection log, and it is untrusted: the
 helper prints control and format characters in it as visible escapes (for

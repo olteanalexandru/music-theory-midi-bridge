@@ -194,6 +194,54 @@ describe('claiming a port, which is claiming an Ableton track', () => {
         expect(code).toBe(CLOSE_BAD_CLAIM);
     });
 
+    // 1.0.9: the necks on the app's Pad Grid engine claim their own ports,
+    // so a guitar or a bass neck lands on its own Live track, not the pads'.
+    it('puts the Guitar and the Bass neck on ports of their own', async () => {
+        const guitar = await connect(`?t=${TOKEN}&port=guitar`);
+        const bass = await connect(`?t=${TOKEN}&port=bassNeck`);
+        expect(guitar.code).toBeUndefined();
+        expect(bass.code).toBeUndefined();
+        expect(guitar.hello).toMatchObject({ claimed: 'guitar', portName: 'Tutor Guitar' });
+        expect(bass.hello).toMatchObject({ claimed: 'bassNeck', portName: 'Tutor Bass' });
+
+        guitar.socket.send(JSON.stringify({ t: 0, b: [0x90, 52, 100] }));
+        bass.socket.send(JSON.stringify({ t: 0, b: [0x90, 40, 100] }));
+        await settle();
+        expect(sentTo('Tutor Guitar')).toEqual([[0x90, 52, 100]]);
+        expect(sentTo('Tutor Bass')).toEqual([[0x90, 40, 100]]);
+        expect(sentTo(PORT_NAMES.pads)).toEqual([]);
+
+        guitar.socket.close();
+        bass.socket.close();
+    });
+
+    it('takes the claim exactly as the app spells it', async () => {
+        // The app sends 'bassNeck'. Anything near it is an unknown claim,
+        // refused the way a helper from before 1.0.9 refuses 'bassNeck' itself.
+        for (const near of ['bass', 'bassneck', 'BassNeck', 'Guitar']) {
+            const { code } = await connect(`?t=${TOKEN}&port=${near}`);
+            expect(code).toBe(CLOSE_BAD_CLAIM);
+        }
+    });
+
+    it('serves the other instruments on Windows when only the neck ports are missing', async () => {
+        // Somebody whose loopMIDI was set up for 1.0.8 has the four older
+        // ports and not the two new ones: those four keep working, and a neck
+        // gets the missing-port answer that names what to create.
+        await server.close();
+        ports.closeAll();
+        boot('win32', [PORT_NAMES.stylophone, PORT_NAMES.pads, PORT_NAMES.theremin, PORT_NAMES.staff]);
+
+        const pads = await connect(`?t=${TOKEN}&port=pads`);
+        expect(pads.code).toBeUndefined();
+        expect(pads.hello?.missing).toEqual([DEFAULT_PORT_NAME, 'Tutor Guitar', 'Tutor Bass']);
+        pads.socket.close();
+
+        const guitar = await connect(`?t=${TOKEN}&port=guitar`);
+        expect(guitar.hello?.portName).toBe('Tutor Guitar');
+        expect(guitar.code).toBe(CLOSE_NO_PORT);
+    });
+
     it('keeps two instruments on two different ports', async () => {
         // The whole point: one socket, one instrument, one port, one track.
         const a = await connect(`?t=${TOKEN}&port=staff`);
@@ -215,7 +263,9 @@ describe('the hello frame', () => {
         const { hello } = await connect(`?t=${TOKEN}&port=staff`);
         expect(hello?.version).toBe('1.0.0-test');
         expect(hello?.platform).toBe('darwin');
-        expect(hello?.ports).toEqual(ALL_PORT_NAMES);
+        // As a set: the claimed port is re-opened on connect (PortSet.refresh),
+        // which moves it to the end of the open map.
+        expect([...(hello?.ports ?? [])].sort()).toEqual([...ALL_PORT_NAMES].sort());
         expect(hello?.missing).toEqual([]);
     });
 

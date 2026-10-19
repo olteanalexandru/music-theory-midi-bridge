@@ -110,7 +110,7 @@ jobs:
             to npm, and the registry 404s for it.)
 
             **Windows** also needs [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html)
-            and four ports created by hand — the bridge prints the exact names
+            and a port per instrument you play created by hand — the bridge prints the exact names
             on startup. macOS and Linux need nothing else.
 
             Scan the QR code it prints with the phone. It opens a pairing page

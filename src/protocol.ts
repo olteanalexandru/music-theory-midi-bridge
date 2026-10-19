@@ -41,8 +41,16 @@ export interface BridgeMessage {
     b: number[];
 }
 
-/** Which instrument is on the other end, and therefore which port it wants. */
-export const CLAIMS = ['stylophone', 'pads', 'theremin', 'staff'] as const;
+/**
+ * Which instrument is on the other end, and therefore which port it wants.
+ *
+ * 'guitar' and 'bassNeck' arrived in 1.0.9: the necks on the app's Pad Grid
+ * engine (the Guitar page, and the Bass page's neck view - its Pads view stays
+ * on 'pads'). Added, never renamed: an older app never sends them, and a
+ * helper from before 1.0.9 closes a socket claiming one with CLOSE_BAD_CLAIM,
+ * exactly as it closes any claim it does not know.
+ */
+export const CLAIMS = ['stylophone', 'pads', 'theremin', 'staff', 'guitar', 'bassNeck'] as const;
 export type Claim = (typeof CLAIMS)[number];
 
 export function isClaim(value: unknown): value is Claim {
@@ -65,6 +73,8 @@ export const PORT_NAMES: Record<Claim, string> = {
     pads: 'Tutor Pads',
     theremin: 'Tutor Theremin',
     staff: 'Tutor Staff',
+    guitar: 'Tutor Guitar',
+    bassNeck: 'Tutor Bass',
 };
 
 /** Where a socket with no claim goes: one shared port, as before ports had names. */
