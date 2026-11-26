@@ -33,7 +33,7 @@ connect, and it names any loopMIDI port it could not find. Every instrument
 picks the address up from there.
 
 ```
-  music-theory-midi-bridge 1.0.9
+  music-theory-midi-bridge 1.0.10
 
   MIDI logging: off  (--log-midi to print every message)
   Takes folder: C:\Users\you\Documents\Note Noodle\Takes
@@ -57,6 +57,9 @@ picks the address up from there.
 
   [QR]
   https://note-noodle.com/app/bridge?bridge=192.168.1.20%3A8532&t=kfp7mqx2wnhd
+
+  Open on this PC:
+  https://note-noodle.com/app/bridge?bridge=127.0.0.1%3A8532&t=kfp7mqx2wnhd
 
   Your DAW has to switch MPE on for each Tutor port, once - none does it
   by itself:
@@ -326,6 +329,65 @@ recording - and Live records it as real per-note MPE.
 
 ---
 
+## Watch the phone's pads on this PC (1.0.10)
+
+The Pad Grid on the phone can be drawn on the computer that runs the bridge,
+in the app's Bridge page. The bridge is only the pipe between the two: it
+forwards what the phone sends to the browser on this computer, and it keeps
+nothing - no frame is stored, and none is printed, not even with `--log-midi`
+(the console shows how many are watching, never what).
+
+- **The phone has to be the Android app.** A web page on https may not open a
+  `ws://` address on your network, so a phone's browser is blocked from the
+  bridge exactly as it is for MIDI.
+- **Open the second link the banner prints, "Open on this PC", in a browser on
+  this same computer.** It is the pairing link with `127.0.0.1` in place of the
+  phone's address, and the same token. A PC view is let in only from the
+  computer the bridge runs on: the same token from another machine is refused
+  with `4007`, so a token that leaked onto your network still shows nothing.
+- One phone sends (a second one replaces it) and up to four browsers watch.
+- Nothing is sent while nobody watches: the phone is told on its MIDI
+  connection how many are watching, and opens the second connection only
+  while that is more than none.
+
+### The PC view protocol
+
+```
+ws://<host>:8532/view?role=send&t=<token>&client=<label>    (the phone)
+ws://127.0.0.1:8532/view?role=watch&t=<token>               (the PC)
+```
+
+The token is checked before the upgrade, as on `/file`: a wrong one gets a
+socket that reads at most 1024 bytes and is closed with `4001`; an unknown
+`role` is closed with `4002`. All frames are JSON text.
+
+| Frame | From to | When |
+| --- | --- | --- |
+| `{"hello":1,"version":"1.0.10","view":{"role":"send","watchers":n,"maxFrame":4096}}` | helper to sender | on connect |
+| `{"hello":1,"version":"1.0.10","view":{"role":"watch","senders":0}}` | helper to watcher | on connect (`senders` is 0 or 1) |
+| `{"view":{"watchers":n}}` | helper to sender, and to every `/midi` socket | when the number of watching browsers changes |
+| `{"view":{"watchers":n,"resync":true}}` | helper to sender | a watcher arrived or showed its tab again, and once after the hello when n is above 0: send one `snap` |
+| `{"view":{"senders":n}}` | helper to watchers | when a phone starts or stops sending (0 or 1) |
+| the sender's frames | sender to every visible watcher | as received: JSON objects whose `t` is `snap`, `p`, `alive`, `off` or `bye`; any other frame is dropped |
+| `{"visible":true}` or `{"visible":false}` | watcher to helper | when its tab shows or hides; a hidden watcher is not counted and gets no frames |
+
+The `/midi` hello gains `"view":{"path":"/view","maxFrame":4096,"watchers":n}`,
+and its presence is how the app knows the PC view is on offer. No frame the
+helper sends on `/midi` carries a `hello` key except the hello itself, so an
+older app ignores the notices.
+
+Limits: 4096 bytes a frame from the sender and 256 from a watcher (a frame
+over it closes the socket with `1009`), 200 frames and 128 KB a second from
+the sender (over it, `4008`), and four watchers at once (the fifth is closed
+with `4004`). A watcher that falls 256 KB behind is closed with `4006`, never
+skipped: the phone's pointer frames carry only what changed, so one missing
+frame would leave a pad lit. It reconnects and is sent a resync. Close codes:
+`4001` bad token, `4002` unknown role, `4004` too many watchers, `4005` a newer
+sender replaced this one, `4006` too slow, `4007` not on this computer, `4008`
+too many frames.
+
+---
+
 ## Options
 
 ```
@@ -546,6 +608,9 @@ Close codes: `4001` bad token, `4002` unknown claim, `4003` no such port.
 The MIDI hello also carries `files` from 1.0.8 - see below. Its presence is
 how the app knows it may offer **Send to PC**; an older helper sends none.
 
+The MIDI hello also carries `view` from 1.0.10 - see
+[Watch the phone's pads on this PC](#watch-the-phones-pads-on-this-pc-1010).
+
 ### Sending a take (1.0.8)
 
 A path of its own, so the MIDI path keeps its 4096-byte frame cap:
@@ -597,6 +662,15 @@ a fast trill, and a protocol you can read in a log is one somebody can reimpleme
 without the source open beside them.
 
 ---
+
+## Release notes
+
+**1.0.10** - the PC view: the phone's Pad Grid drawn on this computer through
+the bridge (`/view`, see
+[Watch the phone's pads on this PC](#watch-the-phones-pads-on-this-pc-1010)),
+and a second banner link, "Open on this PC". It also carries 1.0.9, which was
+never published: the Guitar and the Bass neck have ports of their own, `Tutor
+Guitar` and `Tutor Bass`. An older app is unaffected: nothing it uses changed.
 
 ## Development
 

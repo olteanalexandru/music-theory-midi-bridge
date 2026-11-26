@@ -23,6 +23,10 @@
 // sends a take to be written into the takes folder (files.ts). That is a
 // second WebSocketServer behind one HTTP server, so the MIDI path keeps its
 // own MAX_FRAME_BYTES and nothing about it changes.
+//
+// Since 1.0.10 it answers VIEW_WS_PATH too: the phone's Pad Grid, forwarded to
+// the browser watching on this computer. A frame passes through and is gone:
+// nothing is stored, and no frame is ever handed to a hook or printed.
 
 import WebSocket, { WebSocketServer, type RawData } from 'ws';
 import { createServer, STATUS_CODES, type IncomingMessage } from 'node:http';
@@ -32,6 +36,10 @@ import {
     CLOSE_BAD_TOKEN,
     CLOSE_BUSY,
     CLOSE_NO_PORT,
+    CLOSE_VIEW_NOT_LOCAL,
+    CLOSE_VIEW_RATE,
+    CLOSE_VIEW_REPLACED,
+    CLOSE_VIEW_TOO_SLOW,
     DEFAULT_PORT_NAME,
     FILE_CAPABILITIES,
     FILE_WS_PATH,
@@ -39,19 +47,34 @@ import {
     MAX_FILE_CONNECTIONS,
     MAX_FILE_PAYLOAD,
     MAX_FRAME_BYTES,
+    MAX_VIEW_BYTES_PER_SECOND,
+    MAX_VIEW_FRAME_BYTES,
+    MAX_VIEW_FRAMES_PER_SECOND,
+    MAX_VIEW_WATCHERS,
+    MAX_WATCH_FRAME_BYTES,
+    MAX_WATCH_FRAMES_PER_SECOND,
     PORT_NAMES,
     PROTOCOL_VERSION,
     REFUSED_MAX_PAYLOAD,
+    VIEW_SLOW_BUFFER_BYTES,
+    VIEW_WS_PATH,
     WS_PATH,
     isClaim,
+    isForwardableViewFrame,
+    isLoopbackAddress,
+    isViewRole,
     parseFileHeader,
     parseMessageDetailed,
+    parseWatcherFrame,
     type Claim,
     type FileErrorCode,
     type FileHelloMessage,
     type FileReply,
     type HelloMessage,
     type TakeExtension,
+    type ViewHelloMessage,
+    type ViewSendersNotice,
+    type ViewWatchersNotice,
 } from './protocol.js';
 import type { PortSet } from './ports.js';
 import { HeldNotes } from './heldNotes.js';
@@ -102,6 +125,17 @@ export interface ServerOptions {
      * closed - see FILE_IDLE_MS. A parameter for the same reason heartbeatMs is.
      */
     fileIdleMs?: number;
+    /**
+     * Where a VIEW_WS_PATH socket came from, for the watch-only-from-this-
+     * computer rule. Absent, `request.socket.remoteAddress`. A parameter so a
+     * test can stand in for a LAN address, which a test machine may not have.
+     */
+    remoteAddressOf?: (request: IncomingMessage) => string | undefined;
+    /**
+     * VIEW_SLOW_BUFFER_BYTES, as a parameter so a test can reach it. Never
+     * set outside a test.
+     */
+    viewSlowBufferBytes?: number;
 }
 
 /**
@@ -154,8 +188,14 @@ export type ServerEvent =
      * stopped answering pings - see HEARTBEAT_MS.
      */
     | { type: 'disconnected'; claim: Claim | null; portName: string; connId: number; ended: number; timedOut: boolean }
-    /** `busy`: FILE_WS_PATH only, MAX_FILE_CONNECTIONS already open. */
-    | { type: 'refused'; reason: 'token' | 'claim' | 'port' | 'busy'; detail: string }
+    /**
+     * `busy`: FILE_WS_PATH only, MAX_FILE_CONNECTIONS already open. The rest
+     * are VIEW_WS_PATH only: `role` not send or watch, `local` a watcher that
+     * is not on this computer, `view-busy` MAX_VIEW_WATCHERS already open.
+     */
+    | { type: 'refused'; reason: 'token' | 'claim' | 'port' | 'busy' | 'role' | 'local' | 'view-busy'; detail: string }
+    /** How many watchers are counted and whether a phone is sending, whenever either changes. Counts only. */
+    | { type: 'view'; senders: 0 | 1; watchers: number }
     /** A take written into the takes folder, under `name` (printable already). */
     | { type: 'file-saved'; fileId: number; client: string; name: string; bytes: number }
     /** A take that was not, and why; `detail` is the name or header asked for, printable. */
@@ -300,6 +340,8 @@ export interface RunningServer {
     connections(): number;
     /** Open FILE_WS_PATH sockets. */
     fileConnections(): number;
+    /** Open VIEW_WS_PATH sockets: the sender (0 or 1) and the watchers, hidden ones included. */
+    viewConnections(): { senders: number; watchers: number };
 }
 
 /** The path of a request URL, compared exactly as `ws` compares its own `path`. */
@@ -353,11 +395,54 @@ export function startServer(options: ServerOptions): RunningServer {
     // no more than REFUSED_MAX_PAYLOAD, so the 32 MiB cap above is only ever
     // open to somebody holding the token.
     const refuser = new WebSocketServer({ noServer: true, maxPayload: REFUSED_MAX_PAYLOAD });
+    // The PC view: one phone sends, a few browsers on this computer watch.
+    // Their own caps, and the same refuser for whoever is turned away.
+    const viewSend = new WebSocketServer({ noServer: true, maxPayload: MAX_VIEW_FRAME_BYTES });
+    const viewWatch = new WebSocketServer({ noServer: true, maxPayload: MAX_WATCH_FRAME_BYTES });
+    const remoteAddressOf = options.remoteAddressOf ?? ((request: IncomingMessage) => request.socket.remoteAddress);
     const report = options.onEvent ?? (() => undefined);
     const fileIdleMs = options.fileIdleMs ?? FILE_IDLE_MS;
     let lastFileId = 0;
 
     http.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
+        if (pathOf(request.url) === VIEW_WS_PATH) {
+            const url = new URL(request.url ?? VIEW_WS_PATH, 'http://localhost');
+            const client = printable(url.searchParams.get('client') ?? 'unknown', MAX_CLIENT_LABEL);
+            const refuse = (code: number, reason: string) =>
+                refuser.handleUpgrade(request, socket, head, (refused) => {
+                    refused.on('error', () => undefined);
+                    refused.close(code, reason);
+                });
+            // Before the upgrade, as on /file: nobody without the token gets a
+            // socket that reads more than REFUSED_MAX_PAYLOAD.
+            if (!tokensMatch(url.searchParams.get('t') ?? '', options.token)) {
+                report({ type: 'refused', reason: 'token', detail: client });
+                refuse(CLOSE_BAD_TOKEN, 'bad token');
+                return;
+            }
+            const role = url.searchParams.get('role');
+            if (!isViewRole(role)) {
+                report({ type: 'refused', reason: 'role', detail: printable(role ?? '', MAX_CLIENT_LABEL) });
+                refuse(CLOSE_BAD_CLAIM, 'unknown view role');
+                return;
+            }
+            if (role === 'watch') {
+                if (!isLoopbackAddress(remoteAddressOf(request))) {
+                    report({ type: 'refused', reason: 'local', detail: client });
+                    refuse(CLOSE_VIEW_NOT_LOCAL, 'the PC view can only be watched on the computer running the helper');
+                    return;
+                }
+                if (viewWatchers.size >= MAX_VIEW_WATCHERS) {
+                    report({ type: 'refused', reason: 'view-busy', detail: client });
+                    refuse(CLOSE_BUSY, 'too many watchers');
+                    return;
+                }
+                viewWatch.handleUpgrade(request, socket, head, (accepted) => viewWatch.emit('connection', accepted, request));
+                return;
+            }
+            viewSend.handleUpgrade(request, socket, head, (accepted) => viewSend.emit('connection', accepted, request));
+            return;
+        }
         if (files && pathOf(request.url) === FILE_WS_PATH) {
             const url = new URL(request.url ?? FILE_WS_PATH, 'http://localhost');
             const client = printable(url.searchParams.get('client') ?? 'unknown', MAX_CLIENT_LABEL);
@@ -478,6 +563,7 @@ export function startServer(options: ServerOptions): RunningServer {
             missing: options.ports.missing,
             // Its presence is the capability - see HelloMessage.files.
             ...(files ? { files: FILE_CAPABILITIES } : {}),
+            view: { path: VIEW_WS_PATH, maxFrame: MAX_VIEW_FRAME_BYTES, watchers: visibleWatchers() },
         };
         socket.send(JSON.stringify(hello));
 
@@ -738,15 +824,196 @@ export function startServer(options: ServerOptions): RunningServer {
         });
     });
 
+    // *** THE PC VIEW *** - see VIEW_WS_PATH in protocol.ts for the protocol.
+    //
+    // This is a pipe. A frame comes off the sender's socket, goes onto each
+    // visible watcher's, and is gone: no variable holds one after that, and
+    // none reaches onMessage, onDrop, onEvent or a console. What is counted is
+    // sockets - the counts below and nothing else.
+    const slowBytes = options.viewSlowBufferBytes ?? VIEW_SLOW_BUFFER_BYTES;
+    /** The one phone sending, if any. A newer sender replaces it. */
+    let viewSender: WebSocket | null = null;
+    /** Every watcher, with whether its tab is visible. Only visible ones are counted and sent to. */
+    const viewWatchers = new Map<WebSocket, { visible: boolean }>();
+    /** The watcher count last told to the /midi sockets. */
+    let announced = 0;
+
+    function visibleWatchers(): number {
+        let count = 0;
+        for (const state of viewWatchers.values()) if (state.visible) count += 1;
+        return count;
+    }
+
+    const sendJson = (socket: WebSocket, message: ViewWatchersNotice | ViewSendersNotice | ViewHelloMessage) => {
+        if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+    };
+
+    /**
+     * Tells whoever needs to know that the watchers changed - and only when
+     * the count did. `arrived` is a watcher coming (or showing its tab again):
+     * the sender is asked for one fresh snapshot, in the same frame.
+     */
+    const watchersChanged = (arrived: boolean) => {
+        const count = visibleWatchers();
+        if (count === announced) return;
+        announced = count;
+        const notice: ViewWatchersNotice = { view: { watchers: count } };
+        // Every /midi socket, as the phone's Pad Grid is connected to one.
+        // Never with a `hello` key: see the note in protocol.ts.
+        for (const client of wss.clients) sendJson(client, notice);
+        if (viewSender) sendJson(viewSender, arrived ? { view: { watchers: count, resync: true } } : notice);
+        report({ type: 'view', senders: viewSender ? 1 : 0, watchers: count });
+    };
+
+    const sendersChanged = () => {
+        const notice: ViewSendersNotice = { view: { senders: viewSender ? 1 : 0 } };
+        for (const watcher of viewWatchers.keys()) sendJson(watcher, notice);
+        report({ type: 'view', senders: viewSender ? 1 : 0, watchers: visibleWatchers() });
+    };
+
+    /** The heartbeat of the MIDI sockets, for a VIEW_WS_PATH one; returns what stops it. */
+    const keepAlive = (socket: WebSocket): (() => void) => {
+        if (heartbeatMs <= 0) return () => undefined;
+        let missed = 0;
+        socket.on('pong', () => {
+            missed = 0;
+        });
+        const timer = setInterval(() => {
+            if (missed >= MISSED_PONGS_ALLOWED) {
+                socket.terminate();
+                return;
+            }
+            missed += 1;
+            try {
+                socket.ping();
+            } catch {
+                // Already closing; `close` is on its way.
+            }
+        }, heartbeatMs);
+        timer.unref?.();
+        return () => clearInterval(timer);
+    };
+
+    /** A one-second window of frames and bytes; true while a socket is within its limits. */
+    const withinRate = (maxFrames: number, maxBytes: number) => {
+        let windowStart = performance.now();
+        let frames = 0;
+        let bytes = 0;
+        return (size: number): boolean => {
+            const now = performance.now();
+            if (now - windowStart >= 1000) {
+                windowStart = now;
+                frames = 0;
+                bytes = 0;
+            }
+            frames += 1;
+            bytes += size;
+            return frames <= maxFrames && bytes <= maxBytes;
+        };
+    };
+
+    viewSend.on('connection', (socket: WebSocket) => {
+        const previous = viewSender;
+        viewSender = socket;
+        // Newer wins. The old one is no longer `viewSender`, so its frames are
+        // ignored from here on and its close changes no count.
+        if (previous) previous.close(CLOSE_VIEW_REPLACED, 'replaced by a newer sender');
+        const count = visibleWatchers();
+        sendJson(socket, {
+            hello: PROTOCOL_VERSION,
+            version: options.version,
+            view: { role: 'send', watchers: count, maxFrame: MAX_VIEW_FRAME_BYTES },
+        });
+        // A new sender has shown nobody anything yet.
+        if (count > 0) sendJson(socket, { view: { watchers: count, resync: true } });
+        if (!previous) sendersChanged();
+
+        const stopKeepAlive = keepAlive(socket);
+        const within = withinRate(MAX_VIEW_FRAMES_PER_SECOND, MAX_VIEW_BYTES_PER_SECOND);
+        socket.on('message', (data: RawData, isBinary: boolean) => {
+            if (viewSender !== socket) return;
+            const bytes = toBuffer(data);
+            if (!within(bytes.length)) {
+                socket.close(CLOSE_VIEW_RATE, 'too many frames');
+                return;
+            }
+            // Dropped, not answered, as on /midi. Binary frames are not part of the protocol.
+            if (isBinary) return;
+            const text = bytes.toString('utf8');
+            if (!isForwardableViewFrame(text)) return;
+            for (const [watcher, state] of viewWatchers) {
+                if (!state.visible || watcher.readyState !== WebSocket.OPEN) continue;
+                // Never a frame skipped for a slow watcher: `p` sends only what
+                // changed, so a missed one leaves a pad stuck. It is closed and
+                // reconnects to a resync.
+                if (watcher.bufferedAmount > slowBytes) {
+                    state.visible = false;
+                    watcher.close(CLOSE_VIEW_TOO_SLOW, 'too slow');
+                    continue;
+                }
+                watcher.send(text);
+            }
+            // A watcher just closed for being slow is not counted any more.
+            watchersChanged(false);
+        });
+        // `ws` closes by itself over MAX_VIEW_FRAME_BYTES (1009).
+        socket.on('error', () => undefined);
+        socket.on('close', () => {
+            stopKeepAlive();
+            if (viewSender !== socket) return;
+            viewSender = null;
+            sendersChanged();
+        });
+    });
+
+    viewWatch.on('connection', (socket: WebSocket) => {
+        // The upgrade check was a moment ago; several can arrive inside it.
+        if (viewWatchers.size >= MAX_VIEW_WATCHERS) {
+            socket.on('error', () => undefined);
+            socket.close(CLOSE_BUSY, 'too many watchers');
+            return;
+        }
+        const state = { visible: true };
+        viewWatchers.set(socket, state);
+        sendJson(socket, { hello: PROTOCOL_VERSION, version: options.version, view: { role: 'watch', senders: viewSender ? 1 : 0 } });
+        watchersChanged(true);
+
+        const stopKeepAlive = keepAlive(socket);
+        const within = withinRate(MAX_WATCH_FRAMES_PER_SECOND, MAX_WATCH_FRAME_BYTES * MAX_WATCH_FRAMES_PER_SECOND);
+        socket.on('message', (data: RawData, isBinary: boolean) => {
+            const bytes = toBuffer(data);
+            if (!within(bytes.length)) {
+                socket.close(CLOSE_VIEW_RATE, 'too many frames');
+                return;
+            }
+            if (isBinary) return;
+            const frame = parseWatcherFrame(bytes.toString('utf8'));
+            if (!frame || frame.visible === state.visible) return;
+            state.visible = frame.visible;
+            // Showing again is an arrival: the sender is asked for a snapshot.
+            watchersChanged(frame.visible);
+        });
+        socket.on('error', () => undefined);
+        socket.on('close', () => {
+            stopKeepAlive();
+            if (viewWatchers.delete(socket)) watchersChanged(false);
+        });
+    });
+
     return {
         connections: () => wss.clients.size,
         fileConnections: () => files?.clients.size ?? 0,
+        viewConnections: () => ({ senders: viewSender ? 1 : 0, watchers: viewWatchers.size }),
         close: () =>
             new Promise<void>((resolve) => {
                 shuttingDown = true;
                 for (const client of wss.clients) client.terminate();
                 for (const client of files?.clients ?? []) client.terminate();
                 for (const client of refuser.clients) client.terminate();
+                for (const client of viewSend.clients) client.terminate();
+                for (const client of viewWatch.clients) client.terminate();
+                viewSend.close();
+                viewWatch.close();
                 wss.close();
                 files?.close();
                 refuser.close();

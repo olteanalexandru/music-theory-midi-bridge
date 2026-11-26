@@ -119,6 +119,13 @@ export interface HelloMessage {
      * started without a takes folder, which only a test does.
      */
     files?: FileCapabilities;
+    /**
+     * Where the phone may send its Pad Grid for a PC to watch, and how many
+     * are watching now - see VIEW_WS_PATH. Its presence IS the capability, as
+     * `files` is: a helper from before 1.0.10 sends none, and the app then
+     * offers nothing.
+     */
+    view?: ViewCapabilities;
 }
 
 /** Rejection reasons, sent as a WebSocket close code's reason string. */
@@ -127,6 +134,14 @@ export const CLOSE_BAD_CLAIM = 4002;
 export const CLOSE_NO_PORT = 4003;
 /** FILE_WS_PATH only: MAX_FILE_CONNECTIONS are already open. */
 export const CLOSE_BUSY = 4004;
+/** VIEW_WS_PATH sender only: a newer sender took its place. */
+export const CLOSE_VIEW_REPLACED = 4005;
+/** VIEW_WS_PATH watcher only: it fell more than VIEW_SLOW_BUFFER_BYTES behind. */
+export const CLOSE_VIEW_TOO_SLOW = 4006;
+/** VIEW_WS_PATH watcher only: the socket did not come from this computer. */
+export const CLOSE_VIEW_NOT_LOCAL = 4007;
+/** VIEW_WS_PATH only: over the frame or byte rate of its role. */
+export const CLOSE_VIEW_RATE = 4008;
 
 // *** SENDING A TAKE TO THIS PC (1.0.8) ***
 //
@@ -283,6 +298,135 @@ export function parseFileHeader(raw: string): ParsedFileHeader {
     if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) return { ok: false, code: 'bad-header' };
     if (size === 0) return { ok: false, code: 'empty' };
     return { ok: true, header: { name, size } };
+}
+
+// *** THE PC VIEW (1.0.10) ***
+//
+// The phone's Pad Grid drawn on the PC the helper runs on. The helper is only
+// the pipe: it forwards what one phone sends to the browsers watching on this
+// computer, and it stores nothing and prints no frame - counts only, even with
+// --log-midi.
+//
+//   phone   ws://<host>:<port>/view?role=send&t=<token>&client=<label>
+//   PC      ws://127.0.0.1:<port>/view?role=watch&t=<token>
+//
+// The token is checked before the upgrade, as on /file. One sender (a newer
+// one replaces the older, CLOSE_VIEW_REPLACED), at most MAX_VIEW_WATCHERS
+// watchers, and a watcher is accepted only from this computer
+// (CLOSE_VIEW_NOT_LOCAL): a token that leaked onto the LAN shows nothing.
+//
+//   helper -> sender   {"hello":1,"version":..,"view":{"role":"send","watchers":n,"maxFrame":4096}}
+//   helper -> watcher  {"hello":1,"version":..,"view":{"role":"watch","senders":0|1}}
+//   helper -> sender   {"view":{"watchers":n}}  when n changes;
+//                      {"view":{"watchers":n,"resync":true}} when a watcher arrived
+//                      (and once after the hello when n > 0): send one `snap`
+//   helper -> watcher  {"view":{"senders":n}}   when it changes
+//   sender -> helper   mirror frames, JSON text with t in VIEW_FRAME_TYPES,
+//                      forwarded to every visible watcher exactly as received
+//   watcher -> helper  {"visible":true|false}   (anything else is dropped)
+//   helper -> /midi    {"view":{"watchers":n}}  on every /midi socket, when n changes
+//
+// No helper frame on /midi carries a numeric `hello` key but the hello itself:
+// an older site takes any such frame for a hello and overwrites its status.
+
+/** The path the phone and the PC view connect to. */
+export const VIEW_WS_PATH = '/view';
+
+/** Watchers at once, hidden ones included; the next is closed with CLOSE_BUSY. */
+export const MAX_VIEW_WATCHERS = 4;
+
+/** What `ws` reads from the sender: one mirror frame, the same cap as MAX_FRAME_BYTES. */
+export const MAX_VIEW_FRAME_BYTES = 4096;
+
+/** What `ws` reads from a watcher: {"visible":false} is 17 bytes. */
+export const MAX_WATCH_FRAME_BYTES = 256;
+
+/** The sender's frames per second, over which it is closed with CLOSE_VIEW_RATE (one pen at 60 a second is under a third of it). */
+export const MAX_VIEW_FRAMES_PER_SECOND = 200;
+
+/** The sender's bytes per second (128 KB), over which it is closed with CLOSE_VIEW_RATE. */
+export const MAX_VIEW_BYTES_PER_SECOND = 128 * 1024;
+
+/** A watcher's frames per second (it only ever says visible or hidden). */
+export const MAX_WATCH_FRAMES_PER_SECOND = 20;
+
+/**
+ * Bytes a watcher's socket may have queued before it is closed with
+ * CLOSE_VIEW_TOO_SLOW. A frame is never dropped for a slow watcher: `p`
+ * carries lit and pressed only when they change, so one dropped frame would
+ * leave a pad stuck lit. A watcher that cannot keep up reconnects and is
+ * given a resync instead.
+ */
+export const VIEW_SLOW_BUFFER_BYTES = 256 * 1024;
+
+/** The `t` values the helper forwards; the PC's own parser checks the rest. */
+export const VIEW_FRAME_TYPES = ['snap', 'p', 'alive', 'off', 'bye'] as const;
+
+export const VIEW_ROLES = ['send', 'watch'] as const;
+export type ViewRole = (typeof VIEW_ROLES)[number];
+
+export function isViewRole(value: unknown): value is ViewRole {
+    return typeof value === 'string' && (VIEW_ROLES as readonly string[]).includes(value);
+}
+
+/** In the MIDI hello. `watchers` is how many are counted now. */
+export interface ViewCapabilities {
+    path: typeof VIEW_WS_PATH;
+    maxFrame: typeof MAX_VIEW_FRAME_BYTES;
+    watchers: number;
+}
+
+/** Helper -> sender or watcher, once, as a VIEW_WS_PATH socket is accepted. */
+export interface ViewHelloMessage {
+    hello: typeof PROTOCOL_VERSION;
+    version: string;
+    view:
+        | { role: 'send'; watchers: number; maxFrame: typeof MAX_VIEW_FRAME_BYTES }
+        | { role: 'watch'; senders: 0 | 1 };
+}
+
+/** Helper -> the /midi sockets and the sender. `resync` goes to the sender only. */
+export interface ViewWatchersNotice {
+    view: { watchers: number; resync?: true };
+}
+
+/** Helper -> watchers. */
+export interface ViewSendersNotice {
+    view: { senders: 0 | 1 };
+}
+
+/** Reads a watcher's frame: only {"visible": boolean} means anything. */
+export function parseWatcherFrame(raw: string): { visible: boolean } | null {
+    let value: unknown;
+    try {
+        value = JSON.parse(raw);
+    } catch {
+        return null;
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const { visible } = value as { visible?: unknown };
+    return typeof visible === 'boolean' ? { visible } : null;
+}
+
+/** Whether a sender's frame is one the helper forwards: a JSON object whose `t` is in VIEW_FRAME_TYPES. */
+export function isForwardableViewFrame(raw: string): boolean {
+    let value: unknown;
+    try {
+        value = JSON.parse(raw);
+    } catch {
+        return false;
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const { t } = value as { t?: unknown };
+    return typeof t === 'string' && (VIEW_FRAME_TYPES as readonly string[]).includes(t);
+}
+
+/** Addresses `request.socket.remoteAddress` reports for a connection from this computer. */
+export function isLoopbackAddress(address: string | undefined): boolean {
+    if (!address) return false;
+    if (address === '::1') return true;
+    const v4 = address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address;
+    return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(v4);
 }
 
 /**

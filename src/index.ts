@@ -251,6 +251,26 @@ export function fileEventLine(event: Extract<ServerEvent, { type: 'file-saved' |
     return `  ! not saved, from ${event.client}: ${event.code}${event.detail ? ` (${event.detail})` : ''}`;
 }
 
+/** The address the PC view dials: the helper only lets a watcher in from this computer. */
+export const PC_VIEW_HOST = '127.0.0.1';
+
+/**
+ * What the console prints for the PC view: who is watching, and a watcher or
+ * sender turned away. Counts and labels only - never a frame. Null for any
+ * other event. Every string in it is printable already (server.ts).
+ */
+export function viewEventLine(event: ServerEvent): string | null {
+    if (event.type === 'view') {
+        const phone = event.senders === 1 ? 'the phone is sending' : 'no phone sending';
+        return `  ~ PC view: ${event.watchers} watching, ${phone}`;
+    }
+    if (event.type !== 'refused') return null;
+    if (event.reason === 'local') return `  ! refused ${event.detail}: the PC view can only be watched on this computer`;
+    if (event.reason === 'view-busy') return `  ! refused ${event.detail}: too many PC views open at once`;
+    if (event.reason === 'role') return `  ! refused: unknown PC view role "${event.detail}"`;
+    return null;
+}
+
 function banner(args: Args, token: string, ports: ReturnType<typeof openPorts>, version: string): void {
     const found = lanAddresses();
     // --host wins outright: it is somebody who already knows which of their
@@ -337,7 +357,12 @@ function banner(args: Args, token: string, ports: ReturnType<typeof openPorts>, 
     const url = pairingUrl({ host, port: args.port, token, appOrigin: args.appOrigin });
     console.log('\n  Scan this with the phone:\n');
     qrcode.generate(url, { small: true }, (code: string) => console.log(code));
-    console.log(`  ${url}\n`);
+    console.log(`  ${url}`);
+    // The PC view (1.0.10): the same pairing link with the loopback address,
+    // because the phone's LAN address cannot be opened from the https site on
+    // this computer, and the helper lets a watcher in only from here.
+    console.log('\n  Open on this PC:');
+    console.log(`  ${pairingUrl({ host: PC_VIEW_HOST, port: args.port, token, appOrigin: args.appOrigin })}\n`);
     for (const line of DAW_SETUP_LINES) console.log(`  ${line}`);
     console.log('');
 }
@@ -410,7 +435,10 @@ function main(): void {
         takesDir: resolveTakesDir(args.takesDir),
         onEvent: (event) => {
             if (args.quiet) return;
-            if (event.type === 'file-saved' || event.type === 'file-refused') console.log(fileEventLine(event));
+            const viewLine = viewEventLine(event);
+            if (viewLine) console.log(viewLine);
+            else if (event.type === 'view') return;
+            else if (event.type === 'file-saved' || event.type === 'file-refused') console.log(fileEventLine(event));
             else if (event.type === 'connected') console.log(`  + ${event.client} -> ${event.portName}${connTag(event.connId)}`);
             else if (event.type === 'disconnected') {
                 // Said, because it is the bridge acting on its own: without
